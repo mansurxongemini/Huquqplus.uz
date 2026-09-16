@@ -2,8 +2,8 @@ services:
   mariadb:
     image: mariadb
     restart: always
-    ports:
-      - "127.0.0.1:3306:3306"
+#    ports:
+#      - "3306:3306"
     environment:
       - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
       - MYSQL_DATABASE=${DB_NAME}
@@ -23,9 +23,6 @@ services:
   app:
     command: /start.sh
     restart: always
-    build:
-      context: .
-      dockerfile: docker/base.Dockerfile
     image: aaliboyev/hqplus_bot:latest
     env_file:
       - .env
@@ -56,9 +53,6 @@ services:
     depends_on:
       - redis
       - mariadb
-    build:
-      context: .
-      dockerfile: docker/base.Dockerfile
     image: aaliboyev/hqplus_bot:latest
     command: ['sh', '/worker-start.sh']
     env_file:

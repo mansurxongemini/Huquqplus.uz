@@ -1,4 +1,6 @@
+import logging
 from typing import TypeVar
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from sqlmodel import Session, select, col, and_
 from sulguk import SULGUK_PARSE_MODE
 from src.app.split_message import truncate_string
@@ -7,6 +9,8 @@ from src.database.mysql import engine
 from src.models.inquiry import Inquiry, InquiryStatus, InquiryMediaType
 from src.tasks.utils import async_celery_task
 from src.config.bot import bot
+
+logger = logging.getLogger(__name__)
 
 
 InquiryType = TypeVar("InquiryType", bound="Inquiry")
@@ -27,12 +31,25 @@ async def daily_reminder():
                 grouped_inquiries[i.group_id] = [i]
 
         for group_id, inquiries in grouped_inquiries.items():
-            await bot.send_message(
-                chat_id=group_id,
-                text=create_reminder_text(inquiries),
-                parse_mode=SULGUK_PARSE_MODE,
-                link_preview_options={"is_disabled": True}
-            )
+            text = create_reminder_text(inquiries)
+            try:
+                await bot.send_message(
+                    chat_id=group_id,
+                    text=text,
+                    parse_mode=SULGUK_PARSE_MODE,
+                    link_preview_options={"is_disabled": True}
+                )
+            except TelegramBadRequest as e:
+                logger.error(
+                    "daily_reminder bad request for group_id=%s msg_len=%s error=%s",
+                    group_id,
+                    len(text),
+                    e
+                )
+            except TelegramForbiddenError as e:
+                logger.error("daily_reminder forbidden for group_id=%s error=%s", group_id, e)
+            except TelegramAPIError as e:
+                logger.error("daily_reminder api error for group_id=%s error=%s", group_id, e)
 
 
 def create_reminder_text(inquiries: list[InquiryType]):
@@ -41,11 +58,25 @@ def create_reminder_text(inquiries: list[InquiryType]):
     """
 
     for inquiry in inquiries:
-        paragraph += (f"<p><a href=\"https://t.me/{inquiry.group_id[1:]}/{inquiry.group_question_id}\">"
-                      f"<blockquote>{get_message_text(inquiry)}</blockquote>"
-                      f"</a></p>")
+        group_id = str(inquiry.group_id)
+        link = build_group_message_link(group_id, inquiry.group_question_id)
+        if link:
+            paragraph += (f"<p><a href=\"{link}\">"
+                          f"<blockquote>{get_message_text(inquiry)}</blockquote>"
+                          f"</a></p>")
+        else:
+            paragraph += f"<p><blockquote>{get_message_text(inquiry)}</blockquote></p>"
 
     return paragraph
+
+
+def build_group_message_link(group_id: str, message_id: int) -> str | None:
+    if group_id.startswith("@"):
+        return f"https://t.me/{group_id[1:]}/{message_id}"
+    # Private supergroup/channel ids look like -1001234567890
+    if group_id.startswith("-100") and group_id[4:].isdigit():
+        return f"https://t.me/c/{group_id[4:]}/{message_id}"
+    return None
 
 
 def get_message_text(inquiry: Inquiry):

@@ -19,6 +19,8 @@ class InquiryMediaType(str, Enum):
     voice = "voice"
     video_note = "video_note"
     video = "video"
+    document = "document"
+    photo = "photo"
 
 
 class Inquiry(BaseModel, table=True):
@@ -27,23 +29,27 @@ class Inquiry(BaseModel, table=True):
     section_name: str
     question: str = Field(sa_type=Text)
     private_question_id: int
-    group_question_id: int
+    group_question_id: int = Field(index=True)
     question_mediatype: InquiryMediaType = Field(default=InquiryMediaType.text)
     question_media: str | None = Field(default=None, sa_type=Text)
     group_id: int | str = Field(sa_type=VARCHAR(255))
     bot_id: int = Field(sa_type=BigInteger)
-    status: InquiryStatus = Field(default=InquiryStatus.active)
+    status: InquiryStatus = Field(default=InquiryStatus.active, index=True)
     answer: str | None = Field(default=None, sa_type=Text)
     answer_mediatype: InquiryMediaType = Field(default=InquiryMediaType.text)
     answer_media: str | None = Field(default=None, sa_type=Text)
     group_answer_id: int | None = Field(default=None)
     responder_id: int | None = Field(default=None, sa_type=BigInteger)
-    created_at: datetime | None = Field(default_factory=datetime.now)
+    created_at: datetime | None = Field(default_factory=datetime.now, index=True)
     updated_at: datetime | None = Field(default_factory=datetime.now)
 
     replied_at: datetime | None = Field(default=None)
-    user_id: int | None = Field(default=None, sa_type=BigInteger, foreign_key=table_prefix + "users.user_id")
+    rating: int | None = Field(default=None)
+    feedback: str | None = Field(default=None, sa_type=Text)
+    rated_at: datetime | None = Field(default=None)
+    user_id: int | None = Field(default=None, sa_type=BigInteger, foreign_key=table_prefix + "users.user_id", index=True)
     user: User | None = Relationship()
+    parent_id: int | None = Field(default=None, sa_type=BigInteger, nullable=True, index=True)
 
     @staticmethod
     def get_by_message_id(group_id: str, group_question_id: int, bot_id: int,session: DBSession):

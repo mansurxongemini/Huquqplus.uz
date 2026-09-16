@@ -6,9 +6,8 @@ from dateutil.relativedelta import relativedelta
 from src.app.generate_report import generate_report
 from src.config.bot import bot
 from src.config.celery_app import celery_app
+from src.config.settings import settings
 from src.tasks.utils import async_celery_task
-
-send_report_to = '@d_yusupov'
 
 
 @async_celery_task(celery_app, name="generate_monthly_report")
@@ -20,7 +19,7 @@ async def generate_monthly_report():
 
     file = FSInputFile(filename)
 
-    await bot.send_document(send_report_to, file, caption="Oylik Hisobot")
+    await bot.send_document(settings.get_report_recipient(), file, caption="Oylik Hisobot")
 
 
 @async_celery_task(celery_app, name="generate_weekly_report")
@@ -32,4 +31,4 @@ async def generate_weekly_report():
 
     file = FSInputFile(filename)
 
-    await bot.send_document(send_report_to, file, caption="Haftalik Hisobot")
+    await bot.send_document(settings.get_report_recipient(), file, caption="Haftalik Hisobot")

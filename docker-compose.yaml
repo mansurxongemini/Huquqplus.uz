@@ -34,9 +34,13 @@ services:
       - redis
     volumes:
       - ./src:/app/src
+      - ./alembic.ini:/app/alembic.ini
       - ./data/user_data:/app/user_data
+      - ./.env:/app/.env
     ports:
-      - "80:80"
+      - "8000:80"
+    extra_hosts:
+      - "api.telegram.org:149.154.167.99"
 
   phpmyadmin:
     image: phpmyadmin/phpmyadmin
@@ -54,10 +58,13 @@ services:
   celery_worker:
     volumes:
       - ./src:/app/src
+      - ./.env:/app/.env
     restart: always
     depends_on:
       - redis
       - mariadb
+    extra_hosts:
+      - "api.telegram.org:149.154.167.99"
     build:
       context: .
       dockerfile: docker/base.Dockerfile

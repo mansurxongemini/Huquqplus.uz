@@ -42,7 +42,7 @@ def get_url():
 
     user = settings.DB_USER
     password = settings.DB_PASSWORD
-    server = 'localhost' or settings.DB_HOST
+    server = settings.DB_HOST
     port = settings.DB_PORT
     db = settings.DB_NAME
 
