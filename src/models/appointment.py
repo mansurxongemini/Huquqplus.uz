@@ -25,6 +25,7 @@ class Appointment(BaseModel, table=True):
 
     lawyer_id: int | None = Field(default=None, sa_type=BigInteger, index=True)
     group_message_id: int | None = Field(default=None, index=True)
+    inquiry_id: int | None = Field(default=None, index=True)
 
     status: AppointmentStatus = Field(default=AppointmentStatus.pending, index=True)
 
@@ -39,6 +40,9 @@ class Appointment(BaseModel, table=True):
     meeting_link: str | None = Field(default=None, sa_type=VARCHAR(500))
     cancellation_reason: str | None = Field(default=None, sa_type=Text)
     reminder_sent: bool = Field(default=False)
+    confirm_asked_at: datetime | None = Field(default=None)  # fuqarodan "kela olasizmi?" so'ralgan vaqt
+    citizen_confirmation: str | None = Field(default=None, sa_type=VARCHAR(10))  # "yes" | "no"
+    citizen_notice_message_id: int | None = Field(default=None, sa_type=BigInteger, nullable=True)
 
     rating: int | None = Field(default=None)
     feedback: str | None = Field(default=None, sa_type=Text)

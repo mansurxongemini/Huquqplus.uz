@@ -50,6 +50,12 @@ class Inquiry(BaseModel, table=True):
     user_id: int | None = Field(default=None, sa_type=BigInteger, foreign_key=table_prefix + "users.user_id", index=True)
     user: User | None = Relationship()
     parent_id: int | None = Field(default=None, sa_type=BigInteger, nullable=True, index=True)
+    benefit_id: int | None = Field(default=None, foreign_key="tg_bot_benefits.id", nullable=True, index=True)
+    assigned_volunteer_id: int | None = Field(default=None, sa_type=BigInteger, nullable=True, index=True)
+    assigned_at: datetime | None = Field(default=None)
+    assign_source: str = Field(default="admin", sa_type=VARCHAR(20))
+    assign_message_id: int | None = Field(default=None, nullable=True)
+    from_ai_answer_id: int | None = Field(default=None, nullable=True, index=True)  # fuqaro avtomatik javobdan qoniqmagan
 
     @staticmethod
     def get_by_message_id(group_id: str, group_question_id: int, bot_id: int,session: DBSession):

@@ -1,9 +1,12 @@
+import logging
 import json
 import re
 
 from sqlmodel import Field, select, SQLModel, col
 from datetime import datetime
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class Post(SQLModel, table=True):
@@ -60,5 +63,5 @@ class Post(SQLModel, table=True):
                 })
 
             except Exception as e:
-                print("Error decoding JSON:", e)
+                logger.warning("Error decoding JSON: %s", e)
         return faqs
