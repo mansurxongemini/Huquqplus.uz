@@ -1,8 +1,19 @@
+import socket
 from sqlmodel import create_engine
 from src.config.settings import settings
 
+
+def _get_database_url() -> str:
+    host = settings.DB_HOST
+    try:
+        socket.gethostbyname(host)
+    except (socket.gaierror, socket.herror):
+        host = "127.0.0.1"
+    return f"mysql+pymysql://{settings.DB_USER}:{settings.DB_PASSWORD}@{host}:{settings.DB_PORT}/{settings.DB_NAME}?charset=utf8mb4"
+
+
 engine = create_engine(
-    settings.database_url + '?charset=utf8mb4',
+    _get_database_url(),
     pool_size=20,
     max_overflow=20,
     pool_timeout=30,

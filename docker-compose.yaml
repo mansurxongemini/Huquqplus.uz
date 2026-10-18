@@ -34,6 +34,9 @@ services:
       - redis
     volumes:
       - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./reports:/app/reports
+      - ./imtiyozlar_boshqaruvi:/app/imtiyozlar_boshqaruvi
       - ./alembic.ini:/app/alembic.ini
       - ./data/user_data:/app/user_data
       - ./.env:/app/.env
@@ -58,6 +61,7 @@ services:
   celery_worker:
     volumes:
       - ./src:/app/src
+      - ./imtiyozlar_boshqaruvi:/app/imtiyozlar_boshqaruvi
       - ./.env:/app/.env
     restart: always
     depends_on:

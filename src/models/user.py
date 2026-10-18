@@ -3,7 +3,7 @@ from enum import Enum
 from typing import TypeVar
 
 from sqlalchemy import BigInteger
-from sqlmodel import Field, SQLModel, select
+from sqlmodel import Field, select
 from src.models.base import BaseModel, table_prefix
 from src.routes.deps.db_session import DBSession
 

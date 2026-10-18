@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest, TelegramAPIError
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from sqlmodel import Session, select, func
+from sqlmodel import Session, select
 from sulguk import SULGUK_PARSE_MODE
 
 from src.config.bot import bot
@@ -62,6 +62,8 @@ async def execute_broadcast(broadcast_id: int):
 
             if f == "lang_uz":
                 query = query.where(User.language == "uz")
+            elif f == "lang_oz":
+                query = query.where(User.language == "oz")
             elif f == "lang_ru":
                 query = query.where(User.language == "ru")
             elif f and f.startswith("region:"):
@@ -71,20 +73,8 @@ async def execute_broadcast(broadcast_id: int):
                 disability_type = f.split(":", 1)[1]
                 query = query.where(User.disability_type == disability_type)
 
-            # Count total recipients
-            count_query = select(func.count(User.id)).where(User.is_blocked == False)
-            if f == "lang_uz":
-                count_query = count_query.where(User.language == "uz")
-            elif f == "lang_ru":
-                count_query = count_query.where(User.language == "ru")
-            elif f and f.startswith("region:"):
-                region_name = f.split(":", 1)[1]
-                count_query = count_query.where(User.region == region_name)
-            elif f and f.startswith("disability:"):
-                disability_type = f.split(":", 1)[1]
-                count_query = count_query.where(User.disability_type == disability_type)
-
-            total_target = session.exec(count_query).one()
+            target_users = list(session.exec(query).all())
+            total_target = len(target_users)
             broadcast.total_target = total_target
             session.add(broadcast)
             session.commit()
@@ -96,10 +86,8 @@ async def execute_broadcast(broadcast_id: int):
                 inline_keyboard=[[InlineKeyboardButton(text=button_text, url=button_url)]]
             )
 
-        # 3. Process recipients in batches
-        offset = 0
+        # 3. Process recipients sequentially with rate-limiting
         is_cancelled = False
-
         logger.info("Starting broadcast %s to %s users...", broadcast_id, total_target)
 
         # Initial live stats
@@ -117,29 +105,14 @@ async def execute_broadcast(broadcast_id: int):
         except Exception:
             pass
 
-        while True:
-            # Check cancellation signal in Redis
-            try:
-                cancel_val = await redis_client.get(f"broadcast:{broadcast_id}:cancel")
-                if cancel_val:
-                    is_cancelled = True
-                    logger.info("Broadcast %s was cancelled by admin.", broadcast_id)
-                    break
-            except Exception:
-                pass
-
-            with Session(engine) as session:
-                batch_users = session.exec(query.offset(offset).limit(BATCH_SIZE)).all()
-
-            if not batch_users:
-                break
-
-            for user_id in batch_users:
+        try:
+            for user_id in target_users:
                 # Check cancellation periodically
-                if (sent_count + blocked_count + failed_count) % 50 == 0:
+                if (sent_count + blocked_count + failed_count) % 25 == 0:
                     try:
                         if await redis_client.get(f"broadcast:{broadcast_id}:cancel"):
                             is_cancelled = True
+                            logger.info("Broadcast %s was cancelled by admin.", broadcast_id)
                             break
                     except Exception:
                         pass
@@ -160,19 +133,8 @@ async def execute_broadcast(broadcast_id: int):
                         logger.warning("Telegram flood limit! Sleeping for %s seconds", e.retry_after)
                         await asyncio.sleep(e.retry_after + 0.5)
                     except TelegramForbiddenError:
-                        # User blocked the bot
+                        # User blocked the bot on Telegram (do not block user in DB)
                         blocked_count += 1
-                        # Mark user as blocked in DB
-                        try:
-                            with Session(engine) as update_session:
-                                u = update_session.exec(select(User).where(User.user_id == user_id)).first()
-                                if u:
-                                    u.is_blocked = True
-                                    u.block_reason = "Botni bloklagan (Broadcast orqali aniqlandi)"
-                                    update_session.add(u)
-                                    update_session.commit()
-                        except Exception:
-                            pass
                         break
                     except TelegramBadRequest as e:
                         logger.debug("Bad request for user %s: %s", user_id, e)
@@ -186,13 +148,17 @@ async def execute_broadcast(broadcast_id: int):
                         logger.error("Unexpected error for user %s: %s", user_id, e)
                         failed_count += 1
                         break
+                else:
+                    # 3 marta flood-limit: yuborilmadi, lekin hisobdan tushib qolmasin (aks holda yakun ko'rinmaydi)
+                    if not sent_ok:
+                        failed_count += 1
 
                 # Rate limit delay (~28 msg/sec)
                 await asyncio.sleep(RATE_LIMIT_DELAY)
 
                 # Update live stats in Redis
                 total_processed = sent_count + blocked_count + failed_count
-                if total_processed % 50 == 0 or total_processed == total_target:
+                if total_processed % 25 == 0 or total_processed == total_target:
                     try:
                         await redis_client.hset(
                             f"broadcast:{broadcast_id}:live",
@@ -207,32 +173,41 @@ async def execute_broadcast(broadcast_id: int):
                     except Exception:
                         pass
 
-            if is_cancelled:
-                break
+                # Periodically sync progress to MySQL every 100 messages
+                if total_processed % 100 == 0:
+                    try:
+                        with Session(engine) as update_session:
+                            b_mid = update_session.get(Broadcast, broadcast_id)
+                            if b_mid:
+                                b_mid.sent_count = sent_count
+                                b_mid.blocked_count = blocked_count
+                                b_mid.failed_count = failed_count
+                                update_session.add(b_mid)
+                                update_session.commit()
+                    except Exception:
+                        pass
+        finally:
+            # 4. Finalize broadcast in database
+            end_time = datetime.now()
+            final_status = BroadcastStatus.cancelled if is_cancelled else BroadcastStatus.completed
 
-            offset += BATCH_SIZE
+            with Session(engine) as session:
+                b_final = session.get(Broadcast, broadcast_id)
+                if b_final:
+                    b_final.status = final_status
+                    b_final.sent_count = sent_count
+                    b_final.blocked_count = blocked_count
+                    b_final.failed_count = failed_count
+                    b_final.completed_at = end_time
+                    session.add(b_final)
+                    session.commit()
 
-        # 4. Finalize broadcast in database
-        end_time = datetime.now()
-        final_status = BroadcastStatus.cancelled if is_cancelled else BroadcastStatus.completed
-
-        with Session(engine) as session:
-            b_final = session.get(Broadcast, broadcast_id)
-            if b_final:
-                b_final.status = final_status
-                b_final.sent_count = sent_count
-                b_final.blocked_count = blocked_count
-                b_final.failed_count = failed_count
-                b_final.completed_at = end_time
-                session.add(b_final)
-                session.commit()
-
-        # Clear Redis live key
-        try:
-            await redis_client.delete(f"broadcast:{broadcast_id}:live")
-            await redis_client.delete(f"broadcast:{broadcast_id}:cancel")
-        except Exception:
-            pass
+            # Clear Redis live key
+            try:
+                await redis_client.delete(f"broadcast:{broadcast_id}:live")
+                await redis_client.delete(f"broadcast:{broadcast_id}:cancel")
+            except Exception:
+                pass
 
         # 5. Send completion report to the admin
         if admin_id:
@@ -243,13 +218,12 @@ async def execute_broadcast(broadcast_id: int):
 
             status_word = "bekor qilindi" if is_cancelled else "yakunlandi"
             report_text = f"""
-🏁 <b>Ommaviy xabar (Broadcast) {status_word}!</b>
-━━━━━━━━━━━━━━━━━━━━━
-📊 Jami mo'ljallangan: <b>{total_target}</b> ta
-✅ Muvaffaqiyatli yetkazildi: <b>{sent_count}</b> ta
-🚫 Botni bloklaganlar: <b>{blocked_count}</b> ta
-⚠️ Xatolik bilan yetkazilmadi: <b>{failed_count}</b> ta
-⏱ Sarflangan vaqt: <b>{duration_str}</b>
+🏁 <b>Broadcast {status_word}!</b><br/>
+━━━━━━━━━━━━━━━━━━━━━<br/>
+📊 Jami mo'ljallangan: <b>{total_target}</b> ta<br/>
+✅ Muvaffaqiyatli yetkazildi: <b>{sent_count}</b> ta<br/>
+⚠️ Xatolik bilan yetkazilmadi: <b>{failed_count}</b> ta<br/>
+⏱ Sarflangan vaqt: <b>{duration_str}</b><br/>
 ━━━━━━━━━━━━━━━━━━━━━
 """
             try:

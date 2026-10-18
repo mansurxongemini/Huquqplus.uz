@@ -1,35 +1,32 @@
-import html
+import logging
 from datetime import datetime
 from aiogram import Router, F, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    ReplyKeyboardRemove,
-    LinkPreviewOptions,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from pydantic import BaseModel
 from sulguk import SULGUK_PARSE_MODE
 
-from src.app.enums import create_user_info
+from src.app.inquiry_card import inquiry_card_markup, payload_from_message
+from src.app.question_delivery import deliver_citizen_question
 from src.app.filters import is_private_message
 from src.app.keyboards import (
     inquiry_main_menu,
     inquiry_sections,
-    get_main_menu,
+    get_role_menu,
     get_low_rating_action_keyboard,
     get_inquiry_followup_cancel_keyboard,
 )
 from src.routes.aiogram.inquiry_archive import InquiryFollowupState
-from src.app.translations import t, LANG_UZ, LANG_RU
-from src.models.inquiry import Inquiry, InquiryStatus, InquiryMediaType
+from src.app.translations import t, LANG_UZ
+from src.models.inquiry import Inquiry, InquiryStatus
 from src.models.user import User
 from src.config.settings import settings
+from src.database.redisdb import get_redis
 from src.routes.deps.db_session import DBSession
+
+logger = logging.getLogger(__name__)
 
 inquiry_router = Router(name="inquiry")
 
@@ -53,17 +50,13 @@ class InquiryStateData(BaseModel):
     section: int | None = None
 
 
-def get_block_button_markup(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🚫 Bloklash", callback_data=f"block_user:{user_id}")]
-        ]
-    )
+def get_inquiry_card_markup(inquiry_id: int, user_id: int | None = None) -> InlineKeyboardMarkup:
+    return inquiry_card_markup(inquiry_id)
 
 
 @inquiry_router.message(
     InquiryState.custom_question,
-    F.text.in_([t("inquiry_sections_btn", "uz"), t("inquiry_sections_btn", "ru"), "📁 Boʻlimlar", "📁 Разделы"]),
+    F.text.in_([t("inquiry_sections_btn", "uz"), t("inquiry_sections_btn", "oz"), t("inquiry_sections_btn", "ru"), "📁 Boʻlimlar", "📁 Бўлимлар", "📁 Разделы"]),
 )
 async def return_to_inquiry(message: Message, state: FSMContext, db_session: DBSession):
     user = User.get_by_user_id(message.from_user.id, db_session)
@@ -77,21 +70,21 @@ async def return_to_inquiry(message: Message, state: FSMContext, db_session: DBS
 
 @inquiry_router.message(
     InquiryState.section,
-    F.text.in_([t("btn_back_main", "uz"), t("btn_back_main", "ru"), "⬅️ Asosiy menyu", "⬅️ Главное меню"]),
+    F.text.in_([t("btn_back_main", "uz"), t("btn_back_main", "oz"), t("btn_back_main", "ru"), "⬅️ Asosiy menyu", "⬅️ Асосий меню", "⬅️ Главное меню"]),
 )
 @inquiry_router.message(
     InquiryState.custom_question,
     F.text.in_([
-        t("btn_back_main", "uz"), t("btn_back_main", "ru"),
-        t("btn_cancel", "uz"), t("btn_cancel", "ru"),
-        "⬅️ Asosiy menyu", "⬅️ Главное меню", "❌ Bekor qilish", "❌ Отмена"
+        t("btn_back_main", "uz"), t("btn_back_main", "oz"), t("btn_back_main", "ru"),
+        t("btn_cancel", "uz"), t("btn_cancel", "oz"), t("btn_cancel", "ru"),
+        "⬅️ Asosiy menyu", "⬅️ Асосий меню", "⬅️ Главное меню", "❌ Bekor qilish", "❌ Бекор қилиш", "❌ Отмена"
     ]),
 )
 async def return_to_main(message: Message, state: FSMContext, db_session: DBSession):
     user = User.get_by_user_id(message.from_user.id, db_session)
     lang = user.language if user else LANG_UZ
     await state.clear()
-    return await message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+    return await message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 class InquiryFeedbackState(StatesGroup):
@@ -145,11 +138,15 @@ async def handle_ask_again_callback(query: CallbackQuery, state: FSMContext, db_
             await state.set_state(InquiryFollowupState.waiting_for_message)
             await state.update_data(parent_id=inquiry.id, section_name=inquiry.section_name)
             prompt = t("follow_up_prompt", lang).format(id=inquiry.id)
+            await query.answer()
             return await query.message.edit_text(
                 prompt,
                 reply_markup=get_inquiry_followup_cancel_keyboard(inquiry.id, lang),
                 parse_mode=SULGUK_PARSE_MODE
             )
+    # eski tugma: murojaat ma'lumoti saqlanmagan — yangi savol yuborishga yo'naltiramiz
+    await query.answer(t("menu_inquiry", lang), show_alert=False)
+    await query.message.answer(t("inquiry_send_prompt", lang), parse_mode=SULGUK_PARSE_MODE)
 
     await state.clear()
     await state.set_state(InquiryState.section)
@@ -167,6 +164,7 @@ async def handle_feedback_message(message: Message, state: FSMContext, db_sessio
 
     if message.text in [
         t("menu_profile", "uz"), t("menu_profile", "ru"),
+        t("menu_benefits", "uz"), t("menu_benefits", "ru"),
         t("menu_inquiry", "uz"), t("menu_inquiry", "ru"),
         t("menu_appointment", "uz"), t("menu_appointment", "ru"),
         t("menu_about_us", "uz"), t("menu_about_us", "ru"),
@@ -187,12 +185,12 @@ async def handle_feedback_message(message: Message, state: FSMContext, db_sessio
             db_session.commit()
 
     await state.clear()
-    await message.answer(t("feedback_recorded", lang), reply_markup=get_main_menu(lang))
+    await message.answer(t("feedback_recorded", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 @inquiry_router.message(
     InquiryState.received_answer,
-    F.text.in_([t("btn_yes", "uz"), t("btn_yes", "ru"), "✅ Ha", "✅ Да"]),
+    F.text.in_([t("btn_yes", "uz"), t("btn_yes", "oz"), t("btn_yes", "ru"), "✅ Ha", "✅ Ҳа", "✅ Да"]),
 )
 async def was_useful(message: Message, state: FSMContext, db_session: DBSession):
     user = User.get_by_user_id(message.from_user.id, db_session)
@@ -202,12 +200,12 @@ async def was_useful(message: Message, state: FSMContext, db_session: DBSession)
         inquiry.close(False, db_session)
 
     await state.clear()
-    return await message.answer(t("rate_received_thanks", lang), reply_markup=get_main_menu(lang))
+    return await message.answer(t("rate_received_thanks", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 @inquiry_router.message(
     InquiryState.received_answer,
-    F.text.in_([t("btn_no", "uz"), t("btn_no", "ru"), "❌ Yoʻq", "❌ Нет"]),
+    F.text.in_([t("btn_no", "uz"), t("btn_no", "oz"), t("btn_no", "ru"), "❌ Yoʻq", "❌ Йўқ", "❌ Нет"]),
 )
 async def not_useful(message: Message, state: FSMContext, db_session: DBSession):
     user = User.get_by_user_id(message.from_user.id, db_session)
@@ -226,7 +224,7 @@ async def not_useful(message: Message, state: FSMContext, db_session: DBSession)
 
 
 @inquiry_router.message(
-    F.text.in_([t("menu_inquiry", "uz"), t("menu_inquiry", "ru"), "📩 Savol yuborish", "📩 Задать вопрос"]),
+    F.text.in_([t("menu_inquiry", "uz"), t("menu_inquiry", "oz"), t("menu_inquiry", "ru"), "📩 Savol yuborish", "📩 Савол юбориш", "📩 Задать вопрос"]),
     is_private_message,
 )
 async def start_inquiry(message: Message, state: FSMContext, db_session: DBSession):
@@ -234,7 +232,7 @@ async def start_inquiry(message: Message, state: FSMContext, db_session: DBSessi
     if not user:
         return await message.answer(
             t("user_not_found", "uz"),
-            reply_markup=get_main_menu(),
+            reply_markup=get_role_menu(message.from_user.id, "uz", db_session),
         )
 
     lang = user.language or LANG_UZ
@@ -279,118 +277,30 @@ async def send_custom_question(message: Message, state: FSMContext, db_session: 
         await state.clear()
         return await message.answer(
             t("user_not_found", lang),
-            reply_markup=get_main_menu(lang),
+            reply_markup=get_role_menu(message.from_user.id, lang, db_session),
         )
 
     if user.is_blocked:
         await state.clear()
         return await message.answer(t("user_blocked", lang), parse_mode=SULGUK_PARSE_MODE)
 
+    payload = payload_from_message(message)
+    if payload is None:
+        return await message.answer(t("inquiry_type_prompt", lang))
+
     data = InquiryStateData.model_validate(await state.get_data())
     inquiry_groups = settings.get_inquiry_groups()
     group_id = inquiry_groups.get(data.section_name) or inquiry_groups.get("Boshqa") or settings.LAWYER_APPOINTMENT_GROUP_ID
 
-    user_context = create_user_info(user, with_link=True, lang=lang)
-
-    if message.text:
-        media_data = None
-        media_type = InquiryMediaType.text
-        message_content = message.text
-        sending_message = f"<p><blockquote>{html.escape(message.text)}</blockquote></p>{user_context}"
-        group_message = await bot.send_message(
-            chat_id=group_id,
-            text=sending_message,
-            parse_mode=SULGUK_PARSE_MODE,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-    elif message.voice:
-        media_data = message.voice.model_dump_json()
-        media_type = InquiryMediaType.voice
-        message_content = message.voice.file_id
-        group_message = await bot.send_voice(
-            chat_id=group_id,
-            voice=message.voice.file_id,
-            caption=user_context,
-            parse_mode=SULGUK_PARSE_MODE,
-        )
-    elif message.video_note:
-        media_data = message.video_note.model_dump_json()
-        media_type = InquiryMediaType.video_note
-        message_content = message.video_note.file_id
-        await bot.send_video_note(chat_id=group_id, video_note=message_content)
-        group_message = await bot.send_message(
-            chat_id=group_id,
-            text=f"<b>Yuqoridagi video xabarga javob yuborish uchun ushbu xabarni tanlang.</b><br/> {user_context}",
-            parse_mode=SULGUK_PARSE_MODE,
-        )
-    elif message.video:
-        media_data = message.video.model_dump_json()
-        media_type = InquiryMediaType.video
-        message_content = message.video.file_id
-        group_message = await bot.send_video(
-            chat_id=group_id,
-            video=message_content,
-            caption=user_context,
-            parse_mode=SULGUK_PARSE_MODE,
-        )
-    elif message.document:
-        media_data = message.document.model_dump_json()
-        media_type = InquiryMediaType.document
-        doc_caption = f"📄 <b>Ilova qilingan hujjat:</b> {html.escape(message.document.file_name or 'Hujjat')}"
-        if message.caption:
-            doc_caption += f"<br/><blockquote>{html.escape(message.caption)}</blockquote>"
-        message_content = doc_caption
-        group_message = await bot.send_document(
-            chat_id=group_id,
-            document=message.document.file_id,
-            caption=f"{doc_caption}<br/>{user_context}",
-            parse_mode=SULGUK_PARSE_MODE,
-        )
-    elif message.photo:
-        photo = message.photo[-1]
-        media_data = photo.model_dump_json()
-        media_type = InquiryMediaType.photo
-        photo_caption = "📷 <b>Ilova qilingan fotohujjat</b>"
-        if message.caption:
-            photo_caption += f"<br/><blockquote>{html.escape(message.caption)}</blockquote>"
-        message_content = photo_caption
-        group_message = await bot.send_photo(
-            chat_id=group_id,
-            photo=photo.file_id,
-            caption=f"{photo_caption}<br/>{user_context}",
-            parse_mode=SULGUK_PARSE_MODE,
-        )
-    else:
-        return await message.answer(t("inquiry_type_prompt", lang))
-
-    inquiry = Inquiry(
-        section_name=data.section_name,
-        question=message_content,
-        question_mediatype=media_type,
-        question_media=media_data,
-        private_question_id=message.message_id,
-        group_question_id=group_message.message_id,
-        group_id=group_id,
-        bot_id=bot.id,
-        user_id=message.from_user.id,
-    )
-
-    db_session.add(inquiry)
-    db_session.commit()
-    db_session.refresh(inquiry)
-
     await state.clear()
-
-    await message.answer(
-        t("inquiry_received", lang),
-        reply_markup=get_main_menu(lang),
-        parse_mode=SULGUK_PARSE_MODE,
+    await deliver_citizen_question(
+        bot, message, db_session, user, data.section_name, group_id, payload, message.message_id,
     )
 
 
 @inquiry_router.message(
     InquiryState.awaiting_response,
-    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "ru"), "❌ Bekor qilish", "❌ Отмена"]),
+    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "oz"), t("btn_cancel", "ru"), "❌ Bekor qilish", "❌ Бекор қилиш", "❌ Отмена"]),
 )
 async def awaiting_response(message: Message, state: FSMContext, db_session: DBSession):
     user = User.get_by_user_id(message.from_user.id, db_session)
@@ -410,7 +320,7 @@ async def confirm_cancellation(message: Message, state: FSMContext, db_session: 
     user = User.get_by_user_id(message.from_user.id, db_session)
     lang = user.language if user else LANG_UZ
 
-    if message.text in [t("btn_yes", "uz"), t("btn_yes", "ru"), "Ha", "✅ Ha", "Да", "✅ Да"]:
+    if message.text in [t("btn_yes", "uz"), t("btn_yes", "oz"), t("btn_yes", "ru"), "Ha", "✅ Ha", "Ҳа", "✅ Ҳа", "Да", "✅ Да"]:
         data = await state.get_data()
         inquiry_groups = settings.get_inquiry_groups()
         section_name = data.get("section_name", "Boshqa")
@@ -425,10 +335,19 @@ async def confirm_cancellation(message: Message, state: FSMContext, db_session: 
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=inquiry.group_question_id)
             except Exception as e:
-                print("Failed to delete message in group: ", e)
+                logger.warning("Failed to delete message in group: %s", e)
+
+            try:
+                redis_client = get_redis(is_async=True)
+                cont_msg_id = await redis_client.get(f"inquiry_cont_msg:{inquiry.id}")
+                if cont_msg_id:
+                    cont_id_int = int(cont_msg_id.decode() if isinstance(cont_msg_id, bytes) else cont_msg_id)
+                    await bot.delete_message(chat_id=chat_id, message_id=cont_id_int)
+            except Exception as e:
+                logger.warning("Failed to delete continuation message in group: %s", e)
 
         await state.clear()
-        return await message.answer(t("inquiry_cancelled", lang), reply_markup=get_main_menu(lang))
+        return await message.answer(t("inquiry_cancelled", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
     else:
         await state.set_state(InquiryState.awaiting_response)
         markup = ReplyKeyboardBuilder()

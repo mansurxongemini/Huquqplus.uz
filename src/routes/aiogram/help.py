@@ -6,7 +6,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from sulguk import SULGUK_PARSE_MODE
 
 from src.app.filters import is_private_message
-from src.app.keyboards import get_main_menu
+from src.app.keyboards import get_role_menu
 from src.app.translations import t, LANG_UZ
 from src.config.settings import settings
 from src.models.user import User
@@ -21,7 +21,7 @@ class HelpState(StatesGroup):
 
 
 @help_router.message(
-    F.text.in_([t("menu_help", "uz"), t("menu_help", "ru"), "⁉️ Texnik yordam", "⁉️ Техническая помощь"]),
+    F.text.in_([t("menu_help", "uz"), t("menu_help", "oz"), t("menu_help", "ru"), "⁉️ Texnik yordam", "⁉️ Техник ёрдам", "⁉️ Техническая помощь"]),
     is_private_message,
 )
 async def start_help_request(message: Message, state: FSMContext, db_session: DBSession):
@@ -29,7 +29,7 @@ async def start_help_request(message: Message, state: FSMContext, db_session: DB
     lang = user.language if user else LANG_UZ
 
     if not user:
-        return await message.answer(t("user_not_found", lang), reply_markup=get_main_menu(lang))
+        return await message.answer(t("user_not_found", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
     if user.is_blocked:
         return await message.answer(t("user_blocked", lang), parse_mode=SULGUK_PARSE_MODE)
@@ -46,14 +46,14 @@ async def start_help_request(message: Message, state: FSMContext, db_session: DB
 
 
 @help_router.message(
-    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "ru"), "❌ Bekor qilish", "❌ Отмена"]),
+    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "oz"), t("btn_cancel", "ru"), "❌ Bekor qilish", "❌ Бекор қилиш", "❌ Отмена"]),
     F.state.in_({HelpState.waiting_for_phone_number, HelpState.waiting_for_help_message}),
 )
 async def cancel_help_request(message: Message, state: FSMContext, db_session: DBSession):
     user = User.get_by_user_id(message.from_user.id, db_session)
     lang = user.language if user else LANG_UZ
     await state.clear()
-    await message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+    await message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 @help_router.message(HelpState.waiting_for_phone_number, is_private_message)
@@ -85,7 +85,7 @@ async def process_help_message(message: Message, state: FSMContext, db_session: 
 
     if not user:
         await state.clear()
-        return await message.answer(t("user_not_found", lang), reply_markup=get_main_menu(lang))
+        return await message.answer(t("user_not_found", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
     if user.is_blocked:
         await state.clear()
@@ -100,7 +100,7 @@ async def process_help_message(message: Message, state: FSMContext, db_session: 
         f"<b>Username:</b> @{user.username}<br/>"
         f"<b>ID:</b> <code>{user.user_id}</code><br/>"
         f"<b>Telefon:</b> {phone_number}<br/>"
-        f"<b>Til:</b> {'Oʻzbekcha' if lang == 'uz' else 'Русский'}<br/><br/>"
+        f"<b>Til:</b> {'Ўзбекча' if lang == 'oz' else ('Oʻzbekcha' if lang == 'uz' else 'Русский')}<br/><br/>"
         f"<b>Xabar:</b> {message.text}"
     )
 
@@ -113,5 +113,5 @@ async def process_help_message(message: Message, state: FSMContext, db_session: 
     await state.clear()
     await message.answer(
         t("help_success", lang),
-        reply_markup=get_main_menu(lang),
+        reply_markup=get_role_menu(message.from_user.id, lang, db_session),
     )

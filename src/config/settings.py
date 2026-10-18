@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Annotated, Literal
 from pydantic import AnyUrl, BeforeValidator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,8 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
     DOMAIN: str = "localhost"
     ENVIRONMENT: Literal["local", "staging", "production"] = "local"
+    WEBSITE_API_SECRET_KEY: str = "huquqplus_website_secret_key_2026_secure"
+    API_PORT: int = 80
 
     @property
     def server_host(self) -> str:
@@ -60,9 +63,34 @@ class Settings(BaseSettings):
     ADMIN_IDS: str = ""
     VOLUNTEER_GROUP_ID: str | int | None = None
     VOLUNTEER_REG_KEY: str = "volunteer"
+    VOLUNTEER_LEADERBOARD_PUBLIC: bool = False
+    ASSIGN_ENFORCE_FROM: datetime | None = None
+    ASSIGN_REMINDER_QUIET_START: int = 22
+    ASSIGN_REMINDER_QUIET_END: int = 6
+    ASSIGN_REMINDER_SKIP_WEEKDAYS: str = ""  # eslatma yubormaslik kunlari: "6" — yakshanba, "5,6" — dam olish kunlari
+
+    # RAG AI Assistant sozlamalari (ixtiyoriy)
+    RAG_API_URL: str = ""
+    RAG_API_KEY: str = ""
+    RAG_TIMEOUT_SECONDS: float = 60.0
+    RAG_REVIEW_TIMEOUT_SECONDS: float = 90.0
+    AI_ASSISTANT_ENABLED: bool = True
+    # Fuqarolar AI chatiga kirish (False = fuqaro menyusi/kirish yopiq; True = rollback).
+    # Ichki AI (yurist qoralamasi, volontyor AI nazoratchi) bu bayroqqa bog'liq emas.
+    AI_CITIZEN_ENABLED: bool = False
+    AI_LAWYER_DRAFTS: bool = False  # guruhga AI qoralamasi yuborilmaydi: guruhda faqat haqiqiy javoblar
+    # Fuqaroning oddiy matnli savoliga avtomatik javob (nazoratchi tasdiqlasa); aks holda guruhga
+    AI_CITIZEN_ANSWERS: bool = False
+    AI_AUTO_MIN_CONFIDENCE: float = 0.8
+    AI_AUTO_MIN_SCORE: int = 4
+    AI_AUTO_MAX_QUESTION_CHARS: int = 800
+    AI_AUTO_DAILY_LIMIT_PER_USER: int = 5  # bir fuqaroga kuniga avtomatik javoblar soni
+    AI_AUTO_DAILY_LIMIT: int = 300  # barcha fuqarolar uchun kunlik chegara (xarajat nazorati)
+    AI_BALANCE_ALERT_USD: float = 2.0  # OpenRouter balansi shundan kam bo'lsa adminlarga ogohlantirish
 
     @property
-    def admin_ids_list(self) -> list[int]:
+    def super_admin_ids_list(self) -> list[int]:
+        """Asosiy adminlar (.env ADMIN_IDS): panel orqali o'chirib bo'lmaydi, adminlarni boshqara oladi."""
         if not self.ADMIN_IDS:
             return []
         ids = []
@@ -72,8 +100,24 @@ class Settings(BaseSettings):
                 ids.append(int(i))
         return ids
 
+    @property
+    def admin_ids_list(self) -> list[int]:
+        """Barcha adminlar: .env dagi asosiy + panel orqali qo'shilganlar."""
+        from src.app.admin_registry import get_db_admin_ids
+        ids = list(self.super_admin_ids_list)
+        for uid in sorted(get_db_admin_ids()):
+            if uid not in ids:
+                ids.append(uid)
+        return ids
+
+    def is_super_admin(self, user_id: int) -> bool:
+        return user_id in self.super_admin_ids_list
+
     def is_admin(self, user_id: int) -> bool:
-        return user_id in self.admin_ids_list
+        if user_id in self.super_admin_ids_list:
+            return True
+        from src.app.admin_registry import get_db_admin_ids
+        return user_id in get_db_admin_ids()
 
     # Inquiry section groups
     GROUP_IJTIMOIY_HIMOYA: str | int | None = None

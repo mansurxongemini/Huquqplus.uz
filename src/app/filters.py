@@ -1,3 +1,4 @@
+from aiogram import Bot
 from aiogram.types import Message, CallbackQuery
 from src.config.settings import settings
 
@@ -28,10 +29,12 @@ def is_group_callback(query: CallbackQuery):
     return bool(query.message and query.message.chat and query.message.chat.type in ["group", "supergroup"])
 
 
-def reply_to_my_message(message: Message):
+def reply_to_my_message(message: Message, bot: Bot | None = None):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         return False
     from_user = message.reply_to_message.from_user
+    if bot:
+        return from_user.id == bot.id
     bot_name = (settings.BOT_NAME or "").lstrip("@").lower()
     replied_user = (from_user.username or "").lower()
     return (replied_user and replied_user == bot_name) or from_user.is_bot

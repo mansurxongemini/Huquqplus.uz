@@ -21,7 +21,7 @@ services:
     command: [ 'redis-server', '/tmp/redis.conf', '--requirepass', '${REDIS_PASS}' ]
 
   app:
-    command: /start.sh
+    command: python -m src.run_polling
     restart: always
     build:
       context: .
@@ -34,8 +34,14 @@ services:
       - redis
     volumes:
       - ./data/user_data:/app/user_data
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./reports:/app/reports
+      - ./imtiyozlar_boshqaruvi:/app/imtiyozlar_boshqaruvi
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
+    extra_hosts:
+      - "api.telegram.org:149.154.167.99"
 
 #  phpmyadmin:
 #    image: phpmyadmin/phpmyadmin
@@ -63,3 +69,9 @@ services:
     command: ['sh', '/worker-start.sh']
     env_file:
       - .env
+    extra_hosts:
+      - "api.telegram.org:149.154.167.99"
+    volumes:
+      - ./data/user_data:/app/user_data
+      - ./src:/app/src
+      - ./imtiyozlar_boshqaruvi:/app/imtiyozlar_boshqaruvi

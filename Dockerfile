@@ -25,6 +25,6 @@ RUN chmod +x /start.sh
 COPY ./docker/worker-start.sh /worker-start.sh
 RUN chmod +x /worker-start.sh
 
-EXPOSE 80
+EXPOSE 8080
 
 CMD ["/start.sh"]

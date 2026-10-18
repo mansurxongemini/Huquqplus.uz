@@ -29,3 +29,5 @@ def async_celery_task(celery_app, **celery_kwargs):
             return result
         return celery_app.task(**celery_kwargs)(wrapper)
     return decorator
+
+

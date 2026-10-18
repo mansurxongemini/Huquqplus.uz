@@ -1,4 +1,4 @@
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, time, timedelta
 from sqlmodel import Session, select
 from src.app.timeutils import tz
 from src.models.appointment import Appointment, AppointmentStatus
