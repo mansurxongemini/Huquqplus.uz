@@ -1,5 +1,7 @@
+import html
 import json
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
 from aiogram import Router, F, Bot
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
@@ -16,25 +18,32 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sulguk import SULGUK_PARSE_MODE
 
-from src.app.calendar_utils import get_available_dates, get_time_slots_for_date, format_uz_date
-from src.app.enums import create_user_info
-from src.app.keyboards import get_main_menu
+from src.app.html_utils import escape_multiline
+from src.app.appointment_card import (
+    CARD_DESC_LIMIT,
+    render_appointment_card,
+    get_appointment_markup,
+    get_appointment_type_display,
+)
+from src.app.calendar_utils import format_uz_date
+from src.app.keyboards import get_role_menu
 from src.app.translations import t, get_appointment_text, LANG_UZ
 from src.config.settings import settings
+from sqlalchemy import or_
 from sqlmodel import select
 from src.models.appointment import Appointment, AppointmentStatus
 from src.models.lawyer import OfficialLawyer
 from src.models.user import User
 from src.routes.deps.db_session import DBSession
+import logging
+
+logger = logging.getLogger(__name__)
 
 appointment_router = Router(name="appointment")
 
 
 class AppointmentState(StatesGroup):
     choosing_appointment_type = State()
-    choosing_lawyer = State()
-    choosing_date = State()
-    choosing_time_slot = State()
     entering_problem_and_media = State()
     confirming_booking = State()
 
@@ -43,18 +52,32 @@ class AppointmentFeedbackState(StatesGroup):
     waiting_for_feedback = State()
 
 
+def find_active_appointment(db_session: DBSession, user_id: int, app_type: str) -> Appointment | None:
+    """Fuqaroning shu turdagi faol arizasi. Vaqti bir kundan ko'proq o'tib ketgan, lekin yakunlanmay
+    qolgan ariza hisobga olinmaydi — aks holda u yangi arizaga abadiy to'siq bo'lib qoladi."""
+    stale_before = datetime.now() - timedelta(days=1)
+    return db_session.exec(
+        select(Appointment).where(
+            Appointment.user_id == user_id,
+            Appointment.appointment_type == app_type,
+            Appointment.status.in_([AppointmentStatus.pending, AppointmentStatus.accepted]),
+            or_(Appointment.scheduled_at.is_(None), Appointment.scheduled_at >= stale_before),
+        )
+    ).first()
+
+
 # --- Step 1: Start Appointment & Choose Type ---
 
 
 @appointment_router.message(
-    F.text.in_([t("menu_appointment", "uz"), t("menu_appointment", "ru"), "✍️ Yurist qabuliga yozilish", "✍️ Запись к юристу"])
+    F.text.in_([t("menu_appointment", "uz"), t("menu_appointment", "oz"), t("menu_appointment", "ru"), "✍️ Yurist qabuliga yozilish", "✍️ Юрист қабулига ёзилиш", "✍️ Запись к юристу"])
 )
 async def start_appointment(message: Message, state: FSMContext, db_session: DBSession):
     user = User.get_by_user_id(message.from_user.id, db_session)
     lang = user.language if user else LANG_UZ
 
     if not user:
-        return await message.answer(t("user_not_found", lang), reply_markup=get_main_menu(lang))
+        return await message.answer(t("user_not_found", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
     if user.is_blocked:
         return await message.answer(t("user_blocked", lang), parse_mode=SULGUK_PARSE_MODE)
@@ -92,7 +115,7 @@ async def process_appointment_type(query: CallbackQuery, state: FSMContext, db_s
             await query.message.delete()
         except Exception:
             pass
-        return await query.message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+        return await query.message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(query.from_user.id, lang, db_session))
 
     user = User.get_by_user_id(query.from_user.id, db_session)
     lang = user.language if user else LANG_UZ
@@ -100,58 +123,31 @@ async def process_appointment_type(query: CallbackQuery, state: FSMContext, db_s
     app_type = query.data
 
     # Check if user already has an active appointment of this type
-    active_app = db_session.exec(
-        select(Appointment).where(
-            Appointment.user_id == user.user_id,
-            Appointment.appointment_type == app_type,
-            Appointment.status.in_([AppointmentStatus.pending, AppointmentStatus.accepted])
-        )
-    ).first()
+    active_app = find_active_appointment(db_session, user.user_id, app_type)
 
     if active_app:
         await state.clear()
-        app_name = "📞 Masofaviy qabul (Online)" if app_type == "remote_appointment" else "🏢 Yuzma-yuz qabul (Bosh ofis)"
-        app_time = format_uz_date(active_app.scheduled_at) if active_app.scheduled_at else "Belgilanmagan"
-        status_name = "⏳ Ko'rib chiqilmoqda" if active_app.status == AppointmentStatus.pending else "✅ Qabul qilingan"
-        if lang == "ru":
-            status_name = "⏳ На рассмотрении" if active_app.status == AppointmentStatus.pending else "✅ Принято"
-        lawyer_display = "Istalgan bo'sh yurist"
-        if active_app.lawyer_id:
-            lawyer_obj = db_session.get(OfficialLawyer, active_app.lawyer_id)
-            if not lawyer_obj:
-                lawyer_obj = OfficialLawyer.get_by_user_id(active_app.lawyer_id, db_session)
-            if lawyer_obj:
-                lawyer_display = lawyer_obj.full_name
         if app_type == "in_person_appointment":
-            lawyer_display = "Bosh ofis navbatchi yuristlari"
-
-        warning_card = (
-            f"⚠️ <b>Sizda ushbu yo'nalish bo'yicha faol ariza mavjud!</b><br/><br/>"
-            f"📋 <b>Ariza raqami:</b> №{active_app.id}<br/>"
-            f"🏢 <b>Qabul shakli:</b> {app_name}<br/>"
-            f"📅 <b>Belgilangan vaqt:</b> <b>{app_time}</b><br/>"
-            f"👨‍⚖️ <b>Yurist:</b> {lawyer_display}<br/>"
-            f"🔄 <b>Holati:</b> {status_name}<br/><br/>"
-            f"ℹ️ <i>Bir vaqtning o'zida har bir yo'nalish bo'yicha faqat 1 dona faol ariza bo'lishi mumkin. "
-            f"Yangi ariza topshirish uchun avvalgi qabul yakunlanishi yoki bekor qilinishi lozim.</i>"
-            if lang == "uz" else
-            f"⚠️ <b>У вас уже есть активная запись по этому направлению!</b><br/><br/>"
-            f"📋 <b>Номер заявки:</b> №{active_app.id}<br/>"
-            f"🏢 <b>Формат приема:</b> {app_name}<br/>"
-            f"📅 <b>Время приема:</b> <b>{app_time}</b><br/>"
-            f"👨‍⚖️ <b>Юрист:</b> {lawyer_display}<br/>"
-            f"🔄 <b>Статус:</b> {status_name}<br/><br/>"
-            f"ℹ️ <i>Одновременно разрешена только одна активная запись по каждому направлению. "
-            f"Для новой записи дождитесь завершения или отмените текущую.</i>"
+            lawyer_display = t("app_lawyer_office", lang)
+        else:
+            lawyer_obj = OfficialLawyer.get_by_user_id(active_app.lawyer_id, db_session) if active_app.lawyer_id else None
+            lawyer_display = lawyer_obj.full_name if lawyer_obj else t("app_lawyer_any", lang)
+        warning_card = t(
+            "app_active_warning", lang,
+            id=active_app.id,
+            app_type=get_appointment_type_display(app_type, lang),
+            time=format_uz_date(active_app.scheduled_at) if active_app.scheduled_at else t("app_time_not_set", lang),
+            lawyer=html.escape(lawyer_display),
+            status=t("app_status_pending" if active_app.status == AppointmentStatus.pending else "app_status_accepted", lang),
         )
 
         builder = InlineKeyboardBuilder()
         builder.button(
-            text="❌ Qabulni bekor qilish" if lang == "uz" else "❌ Отменить прием",
+            text=t("btn_app_cancel_mine", lang),
             callback_data=f"app_user_cancel_prompt:{active_app.id}"
         )
         builder.button(
-            text="⬅️ Asosiy menyu" if lang == "uz" else "⬅️ Главное меню",
+            text=t("btn_back_main", lang),
             callback_data="app_cancel"
         )
         builder.adjust(1)
@@ -160,212 +156,25 @@ async def process_appointment_type(query: CallbackQuery, state: FSMContext, db_s
         return await query.answer()
 
     await state.update_data(appointment_type=app_type)
-
-    if app_type == "in_person_appointment":
-        # In person is on Saturdays at central office with on-duty team
-        await state.update_data(lawyer_id=None, lawyer_name="Bosh ofis navbatchi yuristlari")
-        await state.set_state(AppointmentState.choosing_date)
-
-        dates = get_available_dates(app_type)
-        builder = InlineKeyboardBuilder()
-        for d in dates:
-            builder.button(text=d["label"], callback_data=f"app_date:{d['date_str']}")
-        builder.button(text=t("btn_cancel", lang), callback_data="app_cancel")
-        builder.adjust(1)
-
-        prompt_text = (
-            "🏢 <b>Yuzma-yuz qabul uchun shanba kunlaridan birini tanlang:</b><br/>"
-            "<i>(Qabul har shanba 10:00 dan 16:00 gacha Toshkent sh., Yunusobod tumani, Xiyobon ko'chasi 22-uyda o'tkaziladi)</i>"
-            if lang == "uz"
-            else "🏢 <b>Выберите субботу для очного приема:</b>"
-        )
-        await query.message.edit_text(prompt_text, reply_markup=builder.as_markup(), parse_mode=SULGUK_PARSE_MODE)
-        return await query.answer()
-
-    # Remote appointment: Offer lawyer choice or any available
-    await state.set_state(AppointmentState.choosing_lawyer)
-    active_lawyers = OfficialLawyer.get_active_lawyers(db_session)
-
-    builder = InlineKeyboardBuilder()
-    builder.button(
-        text="⭐️ Istalgan bo'sh yurist (Tezroq qabul)" if lang == "uz" else "⭐️ Любой свободный юрист",
-        callback_data="app_lawyer:any"
-    )
-
-    for lawyer in active_lawyers:
-        spec_text = f" ({lawyer.specialization})" if lawyer.specialization else ""
-        builder.button(
-            text=f"👨‍⚖️ {lawyer.full_name}{spec_text}",
-            callback_data=f"app_lawyer:{lawyer.id}"
-        )
-
-    builder.button(text=t("btn_cancel", lang), callback_data="app_cancel")
-    builder.adjust(1)
-
-    prompt_text = (
-        "👨‍⚖️ <b>O'zingizga ma'qul yuristni tanlang yoki istalgan bo'sh yuristga yoziling:</b>"
-        if lang == "uz"
-        else "👨‍⚖️ <b>Выберите юриста или запишитесь к любому свободному специалисту:</b>"
-    )
-
-    await query.message.edit_text(prompt_text, reply_markup=builder.as_markup(), parse_mode=SULGUK_PARSE_MODE)
-    await query.answer()
-
-
-# --- Step 3: Choose Date from Smart Calendar ---
-
-
-@appointment_router.callback_query(AppointmentState.choosing_lawyer, F.data.startswith("app_lawyer:"))
-async def process_lawyer_choice(query: CallbackQuery, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(query.from_user.id, db_session)
-    lang = user.language if user else LANG_UZ
-
-    lawyer_arg = query.data.split(":")[1]
-    if lawyer_arg == "any":
-        lawyer_id = None
-        lawyer_name = "Istalgan bo'sh yurist" if lang == "uz" else "Любой свободный юрист"
-    else:
-        lawyer_id = int(lawyer_arg)
-        lawyer = db_session.get(OfficialLawyer, lawyer_id)
-        lawyer_name = lawyer.full_name if lawyer else "Yurist"
-
-    await state.update_data(lawyer_id=lawyer_id, lawyer_name=lawyer_name)
-    await state.set_state(AppointmentState.choosing_date)
-
-    data = await state.get_data()
-    app_type = data.get("appointment_type", "remote_appointment")
-
-    dates = get_available_dates(app_type)
-    builder = InlineKeyboardBuilder()
-    for d in dates:
-        builder.button(text=d["label"], callback_data=f"app_date:{d['date_str']}")
-    builder.button(text=t("btn_cancel", lang), callback_data="app_cancel")
-    builder.adjust(1)
-
-    prompt_text = (
-        f"👨‍⚖️ Yurist: <b>{lawyer_name}</b><br/><br/>"
-        "📅 <b>Online konsultatsiya uchun qulay sanani tanlang:</b>"
-        if lang == "uz"
-        else f"👨‍⚖️ Юрист: <b>{lawyer_name}</b><br/><br/>📅 <b>Выберите удобную дату:</b>"
-    )
-
-    await query.message.edit_text(prompt_text, reply_markup=builder.as_markup(), parse_mode=SULGUK_PARSE_MODE)
-    await query.answer()
-
-
-# --- Step 4: Choose Time Slot ---
-
-
-@appointment_router.callback_query(AppointmentState.choosing_date, F.data.startswith("app_date:"))
-@appointment_router.callback_query(AppointmentState.choosing_time_slot, F.data == "app_back_to_dates")
-async def process_date_choice(query: CallbackQuery, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(query.from_user.id, db_session)
-    lang = user.language if user else LANG_UZ
-
-    data = await state.get_data()
-    app_type = data.get("appointment_type", "remote_appointment")
-    lawyer_id = data.get("lawyer_id")
-
-    if query.data == "app_back_to_dates":
-        # Go back to date selection
-        await state.set_state(AppointmentState.choosing_date)
-        dates = get_available_dates(app_type)
-        builder = InlineKeyboardBuilder()
-        for d in dates:
-            builder.button(text=d["label"], callback_data=f"app_date:{d['date_str']}")
-        builder.button(text=t("btn_cancel", lang), callback_data="app_cancel")
-        builder.adjust(1)
-        await query.message.edit_text("📅 <b>Qayta sanani tanlang:</b>", reply_markup=builder.as_markup(), parse_mode=SULGUK_PARSE_MODE)
-        return await query.answer()
-
-    date_str = query.data.split(":")[1]
-    await state.update_data(selected_date=date_str)
-    await state.set_state(AppointmentState.choosing_time_slot)
-
-    slots = get_time_slots_for_date(date_str, lawyer_id, app_type, db_session)
-
-    builder = InlineKeyboardBuilder()
-    for s in slots:
-        if s["is_available"]:
-            builder.button(text=f"🟢 {s['label']}", callback_data=f"app_slot:{s['time_str']}")
-        else:
-            builder.button(text=f"🔴 {s['time_str']} (Band)", callback_data="app_slot_busy")
-
-    builder.adjust(2)
-    builder.row(InlineKeyboardButton(text="⬅️ Boshqa sana tanlash", callback_data="app_back_to_dates"))
-    builder.row(InlineKeyboardButton(text=t("btn_cancel", lang), callback_data="app_cancel"))
-
-    target_dt = datetime.strptime(date_str, "%Y-%m-%d")
-    date_display = format_uz_date(target_dt).split(",")[0]
-
-    prompt_text = (
-        f"📅 Tanlangan sana: <b>{date_display}</b><br/><br/>"
-        "⏰ <b>O'zingizga qulay bo'sh vaqt oralig'ini tanlang:</b><br/>"
-        "<i>(Yashil rangdagi vaqtlar bo'sh)</i>"
-        if lang == "uz"
-        else f"📅 Выбранная дата: <b>{date_display}</b><br/><br/>⏰ <b>Выберите свободное время:</b>"
-    )
-
-    await query.message.edit_text(prompt_text, reply_markup=builder.as_markup(), parse_mode=SULGUK_PARSE_MODE)
-    await query.answer()
-
-
-@appointment_router.callback_query(F.data == "app_slot_busy")
-async def slot_busy_callback(query: CallbackQuery):
-    await query.answer("⚠️ Ushbu vaqt oralig'i band qilingan. Iltimos, yashil rangdagi bo'sh vaqtlardan birini tanlang.", show_alert=True)
-
-
-# --- Step 5: Enter Problem & Attach Multimodal Media (Audio, Video, PDF, Photo) ---
-
-
-@appointment_router.callback_query(AppointmentState.choosing_time_slot, F.data.startswith("app_slot:"))
-async def process_slot_choice(query: CallbackQuery, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(query.from_user.id, db_session)
-    lang = user.language if user else LANG_UZ
-
-    slot_time = query.data.split(":", 1)[1]
-    data = await state.get_data()
-    date_str = data.get("selected_date")
-
-    scheduled_at_str = f"{date_str} {slot_time}"
-    await state.update_data(slot_time=slot_time, scheduled_at_str=scheduled_at_str)
     await state.set_state(AppointmentState.entering_problem_and_media)
 
+    send_btn_label = t("btn_send", lang)
     action_kb = ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="📤 Yuborish" if lang == "uz" else "📤 Отправить"),
+                KeyboardButton(text=send_btn_label),
                 KeyboardButton(text=t("btn_cancel", lang)),
             ]
         ],
         resize_keyboard=True,
     )
 
-    prompt = (
-        f"✅ Vaqt tanlandi: <b>{scheduled_at_str}</b><br/><br/>"
-        "📌 <b>Endi muammoingizni bayon qiling va zarur hujjatlarni ilova qiling:</b><br/><br/>"
-        "Siz quyidagi formatlarda ma'lumot yuborishingiz mumkin:<br/>"
-        "• ✍️ <b>Matn</b> shaklida muammo tavsifi<br/>"
-        "• 🎤 <b>Ovozli xabar (Audio)</b> orqali<br/>"
-        "• 📹 <b>Video</b> yoki video-xabar (krujok) orqali<br/>"
-        "• 📄 <b>PDF yoki Word hujjat</b> (sud hujjati, ariza, tibbiy ma'lumotnoma)<br/>"
-        "• 📷 <b>Hujjatning fotosurati</b><br/><br/>"
-        "ℹ️ <i>Bir nechta xabar yoki fayllar yuborishingiz mumkin. Kerakli ma'lumotlarni tashlab bo'lgach, pastdagi <b>📤 Yuborish</b> tugmasini bosing.</i>"
-        if lang == "uz"
-        else (
-            f"✅ Время выбрано: <b>{scheduled_at_str}</b><br/><br/>"
-            "📌 <b>Опишите вашу проблему и прикрепите необходимые документы:</b><br/><br/>"
-            "Вы можете отправить:<br/>"
-            "• ✍️ Текстовое описание<br/>"
-            "• 🎤 Голосовое сообщение<br/>"
-            "• 📹 Видео или видеосообщение<br/>"
-            "• 📄 PDF / Word документ<br/>"
-            "• 📷 Фото документа<br/><br/>"
-            "ℹ️ <i>Вы можете отправить несколько сообщений или файлов. После отправки нажмите <b>📤 Отправить</b> внизу.</i>"
-        )
-    )
+    prompt = t("app_problem_prompt", lang)
 
-    await query.message.delete()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
     await query.message.answer(prompt, reply_markup=action_kb, parse_mode=SULGUK_PARSE_MODE)
     await query.answer()
 
@@ -373,27 +182,9 @@ async def process_slot_choice(query: CallbackQuery, state: FSMContext, db_sessio
 # --- Step 6: Capture Problem Description / Media and Show Confirmation Card ---
 
 
-def parse_scheduled_datetime(dt_str: str) -> datetime:
-    if not dt_str:
-        return datetime.now(tz)
-    dt_str = str(dt_str).strip()
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H"):
-        try:
-            return datetime.strptime(dt_str, fmt)
-        except ValueError:
-            pass
-    return datetime.now(tz)
-
-
-import html
-
-
 async def render_confirmation_card(target_message: Message, state: FSMContext, lang: str):
     data = await state.get_data()
     app_type = data.get("appointment_type", "remote_appointment")
-    app_type_name = "📞 Masofaviy qabul (Online suhbat)" if app_type == "remote_appointment" else "🏢 Yuzma-yuz qabul (Bosh ofisda)"
-    lawyer_name = data.get("lawyer_name", "Istalgan bo'sh yurist")
-    scheduled_at_str = data.get("scheduled_at_str", "")
     problem_text = data.get("problem_description", "")
 
     media_items = list(data.get("media_items", []))
@@ -405,42 +196,31 @@ async def render_confirmation_card(target_message: Message, state: FSMContext, l
             "caption": ""
         }]
 
-    scheduled_dt = parse_scheduled_datetime(scheduled_at_str)
-    formatted_time = format_uz_date(scheduled_dt)
-
     if not media_items:
-        media_display = "Faqat matn"
+        media_display = t("app_media_text_only", lang)
     elif len(media_items) == 1:
-        media_display = f"📄 {media_items[0]['name']}"
+        media_display = f"📄 {html.escape(media_items[0]['name'])}"
     else:
-        names_str = ", ".join([item['name'] for item in media_items])
-        media_display = f"📎 {len(media_items)} ta fayl ({names_str})"
+        media_display = t("app_media_count", lang, n=len(media_items),
+                          names=html.escape(", ".join(item["name"] for item in media_items)))
+    desc_display = problem_text.strip() if problem_text and problem_text.strip() else t("app_desc_by_media", lang)
+    preview_card = t(
+        "app_preview", lang,
+        app_type=get_appointment_type_display(app_type, lang),
+        media=media_display,
+        desc=escape_multiline(desc_display[:350]),
+    )
 
-    desc_display = problem_text.strip() if problem_text and problem_text.strip() else "(Muammo audio/video/fayl orqali bayon etilgan)"
-    desc_escaped = html.escape(desc_display[:350])
-
-    preview_card = f"""
-📋 <b>QABUL MA'LUMOTLARINI TASDIQLANG:</b><br/>
-━━━━━━━━━━━━━━━━━━━━━<br/>
-🏢 <b>Qabul shakli:</b> {app_type_name}<br/>
-👨‍⚖️ <b>Yurist:</b> {lawyer_name}<br/>
-📅 <b>Sana va vaqt:</b> <b>{formatted_time}</b><br/>
-📎 <b>Biriktirilgan fayllar:</b> {media_display}<br/><br/>
-📝 <b>Muammo mazmuni:</b><br/>
-<blockquote>{desc_escaped}</blockquote>
-━━━━━━━━━━━━━━━━━━━━━<br/>
-<i>Barcha ma'lumotlar to'g'rimi? Qabulni tasdiqlaysizmi?</i>
-"""
-
+    btn_confirm_label = t("btn_app_confirm", lang)
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Qabulni tasdiqlash", callback_data="app_confirm:yes")
-    builder.button(text="❌ Bekor qilish", callback_data="app_cancel")
+    builder.button(text=btn_confirm_label, callback_data="app_confirm:yes")
+    builder.button(text=t("btn_cancel", lang), callback_data="app_cancel")
     builder.adjust(1)
 
     confirm_reply_kb = ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="✅ Qabulni tasdiqlash" if lang == "uz" else "✅ Подтвердить прием"),
+                KeyboardButton(text=btn_confirm_label),
                 KeyboardButton(text=t("btn_cancel", lang)),
             ]
         ],
@@ -448,167 +228,201 @@ async def render_confirmation_card(target_message: Message, state: FSMContext, l
     )
 
     await target_message.answer(preview_card, reply_markup=builder.as_markup(), parse_mode=SULGUK_PARSE_MODE)
+    confirm_prompt = t("app_confirm_prompt", lang)
     await target_message.answer(
-        "Qabulni tasdiqlash uchun <b>✅ Qabulni tasdiqlash</b> tugmasini bosing:" if lang == "uz" else "Для подтверждения нажмите <b>✅ Подтвердить прием</b>:",
+        confirm_prompt,
         reply_markup=confirm_reply_kb,
         parse_mode=SULGUK_PARSE_MODE
     )
 
 
+MEDIA_ICONS = {"voice": "🎤", "video_note": "📹", "video": "📹", "photo": "📷", "document": "📄"}
+
+
+def appointment_media_item(message: Message, lang: str) -> dict | None:
+    """Qabul arizasiga biriktiriladigan fayl tavsifi (nomi fuqaro tilida)."""
+    if message.voice:
+        kind, file_id, name = "voice", message.voice.file_id, t("media_voice", lang)
+    elif message.video_note:
+        kind, file_id, name = "video_note", message.video_note.file_id, t("media_video_note", lang)
+    elif message.video:
+        kind, file_id, name = "video", message.video.file_id, t("media_video", lang)
+    elif message.document:
+        kind, file_id, name = "document", message.document.file_id, message.document.file_name or t("media_document", lang)
+    elif message.photo:
+        kind, file_id, name = "photo", message.photo[-1].file_id, t("media_photo", lang)
+    else:
+        return None
+    return {"type": kind, "file_id": file_id, "name": name, "caption": message.caption or f"{MEDIA_ICONS[kind]} {name}"}
+
+
+def _append_text(current: str, extra: str | None) -> str:
+    if not extra:
+        return current
+    return f"{current}\n{extra}".strip() if current else extra
+
+
+_user_appointment_locks: dict[int, asyncio.Lock] = {}
+_pending_media_ack_tasks: dict[int, asyncio.Task] = {}
+
+
+def get_appointment_user_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in _user_appointment_locks:
+        _user_appointment_locks[user_id] = asyncio.Lock()
+    return _user_appointment_locks[user_id]
+
+
 @appointment_router.message(
     AppointmentState.entering_problem_and_media,
-    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "ru"), "❌ Bekor qilish", "❌ Отмена"]),
+    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "oz"), t("btn_cancel", "ru"), "❌ Bekor qilish", "❌ Бекор қилиш", "❌ Отмена"]),
 )
 async def cancel_at_media_step(message: Message, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(message.from_user.id, db_session)
+    user_id = message.from_user.id
+    if user_id in _pending_media_ack_tasks:
+        _pending_media_ack_tasks[user_id].cancel()
+        _pending_media_ack_tasks.pop(user_id, None)
+
+    user = User.get_by_user_id(user_id, db_session)
     lang = user.language if user else LANG_UZ
     await state.clear()
-    await message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+    await message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 @appointment_router.message(AppointmentState.entering_problem_and_media)
 async def handle_appointment_media_input(message: Message, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(message.from_user.id, db_session)
+    user_id = message.from_user.id
+    user = User.get_by_user_id(user_id, db_session)
     lang = user.language if user else LANG_UZ
 
     if not user:
+        if user_id in _pending_media_ack_tasks:
+            _pending_media_ack_tasks[user_id].cancel()
+            _pending_media_ack_tasks.pop(user_id, None)
         await state.clear()
-        return await message.answer(t("user_not_found", lang), reply_markup=get_main_menu(lang))
+        return await message.answer(t("user_not_found", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
     if user.is_blocked:
+        if user_id in _pending_media_ack_tasks:
+            _pending_media_ack_tasks[user_id].cancel()
+            _pending_media_ack_tasks.pop(user_id, None)
         await state.clear()
         return await message.answer(t("user_blocked", lang), parse_mode=SULGUK_PARSE_MODE)
 
     # Check if user pressed "📤 Yuborish" / "📩 Yuborish"
     is_submit = (
         message.text in [
-            "📤 Yuborish", "📤 Отправить",
-            "📩 Yuborish", "📩 Отправить",
-            "✅ Yuborish", "✅ Отправить",
-            "Yuborish", "Отправить",
-            "✅ Qabulni tasdiqlash", "✅ Подтвердить прием"
+            "📤 Yuborish", "📤 Юбориш", "📤 Отправить",
+            "📩 Yuborish", "📩 Юбориш", "📩 Отправить",
+            "✅ Yuborish", "✅ Юбориш", "✅ Отправить",
+            "Yuborish", "Юбориш", "Отправить",
+            "✅ Qabulni tasdiqlash", "✅ Қабулни тасдиқлаш", "✅ Подтвердить прием"
         ]
-        or (message.text and any(w in message.text.strip().lower() for w in ["yuborish", "отправить"]))
+        # matnda "yuborish" so'zi bo'lishi tugma bosilgani emas: fuqaro "ariza yuborish kerakmi?" deb yozishi mumkin
     )
     if is_submit:
+        if user_id in _pending_media_ack_tasks:
+            _pending_media_ack_tasks[user_id].cancel()
+            _pending_media_ack_tasks.pop(user_id, None)
+
+        async with get_appointment_user_lock(user_id):
+            data = await state.get_data()
+            if not data.get("problem_description") and not data.get("media_items") and not data.get("media_file_id"):
+                warning_text = t("app_nothing_to_send", lang)
+                return await message.answer(warning_text, parse_mode=SULGUK_PARSE_MODE)
+
+            await state.set_state(AppointmentState.confirming_booking)
+            return await render_confirmation_card(message, state, lang)
+
+    # Atomically read and update media/problem description under per-user lock
+    async with get_appointment_user_lock(user_id):
         data = await state.get_data()
-        if not data.get("problem_description") and not data.get("media_items") and not data.get("media_file_id"):
-            warning_text = (
-                "⚠️ <b>Iltimos, avval muammoingizni yozing yoki kerakli fayl/audio yuboring!</b><br/><br/>"
-                "So'ng pastdagi <b>📩 Yuborish</b> tugmasini bosing."
-                if lang == "uz" else
-                "⚠️ <b>Пожалуйста, сначала опишите проблему или отправьте файл!</b><br/><br/>"
-                "Затем нажмите <b>📩 Отправить</b> внизу."
-            )
-            return await message.answer(warning_text, parse_mode=SULGUK_PARSE_MODE)
+        current_desc = data.get("problem_description", "")
+        media_items = list(data.get("media_items", []))
 
-        await state.set_state(AppointmentState.confirming_booking)
-        return await render_confirmation_card(message, state, lang)
+        is_media_msg = bool(message.voice or message.video_note or message.video or message.document or message.photo)
+        if is_media_msg and len(media_items) >= 10:
+            limit_err = t("appointment_media_limit_reached", lang)
+            return await message.answer(limit_err, parse_mode=SULGUK_PARSE_MODE)
 
-    # User sent text or media - accumulate into state
-    data = await state.get_data()
-    current_desc = data.get("problem_description", "")
-    media_items = list(data.get("media_items", []))
+        if message.text:
+            current_desc = _append_text(current_desc, message.text)
+        else:
+            item = appointment_media_item(message, lang)
+            if item is None:
+                return await message.answer(t("app_unsupported_media", lang))
+            media_items.append(item)
+            current_desc = _append_text(current_desc, message.caption)
+        latest_media = media_items[-1] if media_items else None
+        await state.update_data(
+            media_items=media_items,
+            media_type=latest_media["type"] if latest_media else "text",
+            media_file_id=latest_media["file_id"] if latest_media else None,
+            media_name=latest_media["name"] if latest_media else None,
+            problem_description=current_desc
+        )
 
-    if message.text:
-        current_desc = f"{current_desc}\n{message.text}".strip() if current_desc else message.text
-    elif message.voice:
-        caption = message.caption or "🎤 Ovozli xabar"
-        media_items.append({
-            "type": "voice",
-            "file_id": message.voice.file_id,
-            "name": "Ovozli xabar",
-            "caption": caption
-        })
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip() if current_desc else message.caption
-    elif message.video_note:
-        media_items.append({
-            "type": "video_note",
-            "file_id": message.video_note.file_id,
-            "name": "Video xabar (krujok)",
-            "caption": "📹 Video xabar (krujok)"
-        })
-    elif message.video:
-        caption = message.caption or "📹 Video murojaat"
-        media_items.append({
-            "type": "video",
-            "file_id": message.video.file_id,
-            "name": "Video fayl",
-            "caption": caption
-        })
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip() if current_desc else message.caption
-    elif message.document:
-        doc_name = message.document.file_name or "Hujjat.pdf"
-        caption = message.caption or f"📄 {doc_name}"
-        media_items.append({
-            "type": "document",
-            "file_id": message.document.file_id,
-            "name": doc_name,
-            "caption": caption
-        })
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip() if current_desc else message.caption
-    elif message.photo:
-        caption = message.caption or "📷 Fotohujjat"
-        media_items.append({
-            "type": "photo",
-            "file_id": message.photo[-1].file_id,
-            "name": "Fotohujjat",
-            "caption": caption
-        })
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip() if current_desc else message.caption
-    else:
-        return await message.answer("⚠️ Iltimos, matn, ovozli xabar, video, PDF hujjat yoki rasm yuboring.")
+    # Cancel previous ack task if one was scheduled
+    if user_id in _pending_media_ack_tasks:
+        _pending_media_ack_tasks[user_id].cancel()
 
-    latest_media = media_items[-1] if media_items else None
-    await state.update_data(
-        media_items=media_items,
-        media_type=latest_media["type"] if latest_media else "text",
-        media_file_id=latest_media["file_id"] if latest_media else None,
-        media_name=latest_media["name"] if latest_media else None,
-        problem_description=current_desc
-    )
+    # Schedule debounced acknowledgement (0.7s) to combine album updates or rapid multi-file uploads into 1 clean reply
+    bot = message.bot
+    chat_id = message.chat.id
 
-    action_kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="📩 Yuborish" if lang == "uz" else "📩 Отправить"),
-                KeyboardButton(text=t("btn_cancel", lang)),
-            ]
-        ],
-        resize_keyboard=True,
-    )
+    async def _send_debounced_ack():
+        try:
+            await asyncio.sleep(0.7)
+            async with get_appointment_user_lock(user_id):
+                current_state = await state.get_state()
+                if current_state != AppointmentState.entering_problem_and_media:
+                    return
 
-    items_count = len(media_items)
-    items_info = ""
-    if items_count > 0:
-        names_list = ", ".join([it["name"] for it in media_items])
-        items_info = f"<br/>📎 <b>Qabul qilingan fayllar ({items_count} ta):</b> <i>{names_list}</i>"
+                d = await state.get_data()
+                cur_media = list(d.get("media_items", []))
+                send_btn_label = t("btn_send", lang)
+                action_kb = ReplyKeyboardMarkup(
+                    keyboard=[
+                        [
+                            KeyboardButton(text=send_btn_label),
+                            KeyboardButton(text=t("btn_cancel", lang)),
+                        ]
+                    ],
+                    resize_keyboard=True,
+                )
 
-    ack_prompt = (
-        f"📥 <b>Ma'lumot qabul qilindi!</b>{items_info}<br/><br/>"
-        "• Agar yana qo'shimcha ma'lumot yoki fayllar bo'lsa, yuborishingiz mumkin.<br/>"
-        "• Barcha ma'lumotlarni tashlab bo'lgach, pastdagi <b>📩 Yuborish</b> tugmasini bosing."
-        if lang == "uz" else
-        f"📥 <b>Информация принята!</b>{items_info}<br/><br/>"
-        "• Вы можете отправить еще текст или файлы.<br/>"
-        "• Когда все будет готово, нажмите кнопку <b>📩 Отправить</b> внизу."
-    )
-    await message.answer(ack_prompt, reply_markup=action_kb, parse_mode=SULGUK_PARSE_MODE)
+                items_info = ""
+                if cur_media:
+                    items_info = t("app_files_received", lang, n=len(cur_media),
+                                   names=html.escape(", ".join(it["name"] for it in cur_media)))
+                ack_prompt = t("app_info_received", lang, files=items_info)
+
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=ack_prompt,
+                    reply_markup=action_kb,
+                    parse_mode=SULGUK_PARSE_MODE
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as ex:
+            import logging
+            logging.getLogger(__name__).warning("Failed to send debounced appointment media ack: %s", ex)
+        finally:
+            _pending_media_ack_tasks.pop(user_id, None)
+
+    _pending_media_ack_tasks[user_id] = asyncio.create_task(_send_debounced_ack())
 
 
 # --- Step 7: Confirm Booking & Dispatch to Lawyer Group ---
 
 
 async def execute_appointment_submission(user: User, lang: str, state: FSMContext, db_session: DBSession, bot: Bot, message_target: Message, is_callback: bool = False, query: CallbackQuery | None = None):
+    if user.user_id in _pending_media_ack_tasks:
+        _pending_media_ack_tasks[user.user_id].cancel()
+        _pending_media_ack_tasks.pop(user.user_id, None)
+
     data = await state.get_data()
     app_type = data.get("appointment_type", "remote_appointment")
-    lawyer_id = data.get("lawyer_id")
-    lawyer_name = data.get("lawyer_name", "Istalgan bo'sh yurist")
-    scheduled_at_str = data.get("scheduled_at_str")
     problem_description = data.get("problem_description", "")
 
     media_items = list(data.get("media_items", []))
@@ -620,48 +434,18 @@ async def execute_appointment_submission(user: User, lang: str, state: FSMContex
             "caption": ""
         }]
 
-    scheduled_dt = parse_scheduled_datetime(scheduled_at_str)
-
-    # Double-check slot availability to prevent double-booking
-    if lawyer_id:
-        taken = db_session.exec(
-            Appointment.__table__.select().where(
-                Appointment.lawyer_id == lawyer_id,
-                Appointment.scheduled_at == scheduled_dt,
-                Appointment.status.in_([AppointmentStatus.pending, AppointmentStatus.accepted])
-            )
-        ).first()
-        if taken:
-            msg = "⚠️ Kechirasiz, ushbu vaqt hozirgina boshqa fuqaro tomonidan band qilindi. Iltimos boshqa vaqt tanlang."
-            if is_callback and query:
-                await query.answer(msg, show_alert=True)
-            else:
-                await message_target.answer(msg)
-            return
-
     # Guard against duplicate active appointment of same type
-    existing_active = db_session.exec(
-        select(Appointment).where(
-            Appointment.user_id == user.user_id,
-            Appointment.appointment_type == app_type,
-            Appointment.status.in_([AppointmentStatus.pending, AppointmentStatus.accepted])
-        )
-    ).first()
+    existing_active = find_active_appointment(db_session, user.user_id, app_type)
     if existing_active:
-        msg = (
-            f"⚠️ Sizda ushbu yo'nalish bo'yicha allaqachon faol ariza (№{existing_active.id}) mavjud!"
-            if lang == "uz" else
-            f"⚠️ У вас уже есть активная запись по этому направлению (№{existing_active.id})!"
-        )
+        msg = t("app_already_active_short", lang, id=existing_active.id)
         await state.clear()
         if is_callback and query:
             await query.answer(msg, show_alert=True)
         else:
-            await message_target.answer(msg, reply_markup=get_main_menu(lang))
+            await message_target.answer(msg, reply_markup=get_role_menu(user.user_id, lang, db_session))
         return
 
     # Create Appointment record
-    initial_status = AppointmentStatus.accepted if lawyer_id else AppointmentStatus.pending
     latest_media = media_items[-1] if media_items else None
     primary_type = latest_media["type"] if latest_media else "text"
     primary_fid = latest_media["file_id"] if latest_media else None
@@ -674,55 +458,24 @@ async def execute_appointment_submission(user: User, lang: str, state: FSMContex
         user_id=user.user_id,
         appointment_type=app_type,
         problem_description=desc_cleaned,
-        lawyer_id=lawyer_id,
-        scheduled_at=scheduled_dt,
+        lawyer_id=None,
+        scheduled_at=None,
         media_type=primary_type,
         media_file_id=primary_fid,
         media_name=primary_name,
         media_meta=media_meta_json,
-        status=initial_status,
+        status=AppointmentStatus.pending,
         reminder_sent=False
     )
     db_session.add(app)
     db_session.commit()
     db_session.refresh(app)
 
-    user_context = create_user_info(user, with_link=True, lang=lang)
-    formatted_time = format_uz_date(scheduled_dt)
-    app_type_text = "Masofaviy qabul (Online)" if app_type == "remote_appointment" else "Yuzma-yuz qabul (Bosh ofis)"
+    # kartada matnning boshi ko'rinadi, qolgani davom xabarida (hech narsa tushib qolmasin)
+    desc_part2 = desc_cleaned[CARD_DESC_LIMIT:].strip() if len(desc_cleaned) > CARD_DESC_LIMIT else ""
 
-    media_count = len(media_items)
-    if media_count == 0:
-        media_summary = "<i>Faqat matn</i>"
-    elif media_count == 1:
-        media_summary = f"<b>{media_items[0]['name']}</b>"
-    else:
-        names_str = ", ".join([item['name'] for item in media_items])
-        media_summary = f"<b>{media_count} ta fayl</b> ({names_str})"
-
-    group_caption = (
-        f"📅 <b>YURIST QABULIGA YANGI ARIZA! (№{app.id})</b><br/>"
-        f"━━━━━━━━━━━━━━━━━━━━━<br/>"
-        f"👤 <b>FUQARO MA'LUMOTLARI:</b><br/>"
-        f"{user_context}<br/>"
-        f"━━━━━━━━━━━━━━━━━━━━━<br/>"
-        f"🏢 <b>QABUL MA'LUMOTLARI:</b><br/>"
-        f"• <b>Qabul shakli:</b> {app_type_text}<br/>"
-        f"• <b>Belgilangan vaqt:</b> <b>{formatted_time}</b><br/>"
-        f"• <b>Biriktirilgan yurist:</b> {lawyer_name}<br/>"
-        f"• 📎 <b>Biriktirilgan fayllar:</b> {media_summary}<br/>"
-        f"━━━━━━━━━━━━━━━━━━━━━<br/>"
-        f"📝 <b>MUAMMO MAZMUNI:</b><br/>"
-        f"<blockquote>{html.escape(desc_cleaned)}</blockquote>"
-    )
-
-    group_builder = InlineKeyboardBuilder()
-    if not lawyer_id:
-        group_builder.button(text="📌 Qabulni olish", callback_data=f"appointment:claim:{app.id}")
-    else:
-        group_builder.button(text="✅ Suhbat yakunlandi", callback_data=f"appointment:complete:{app.id}")
-    group_builder.button(text="🚫 Bloklash", callback_data=f"block_user:{user.user_id}")
-    group_builder.adjust(1)
+    group_caption = render_appointment_card(app, db_session)
+    group_markup = get_appointment_markup(app)
 
     group_id = settings.LAWYER_APPOINTMENT_GROUP_ID
     group_msg = None
@@ -731,20 +484,35 @@ async def execute_appointment_submission(user: User, lang: str, state: FSMContex
         group_msg = await bot.send_message(
             chat_id=group_id,
             text=group_caption,
-            reply_markup=group_builder.as_markup(),
+            reply_markup=group_markup,
             parse_mode=SULGUK_PARSE_MODE,
             link_preview_options=LinkPreviewOptions(is_disabled=True)
         )
+        logger.info("Dispatched appointment %s to lawyer group %s", app.id, group_id)
     except Exception as e:
-        print("Failed to dispatch appointment to lawyer group:", e)
+        logger.error("Failed to dispatch appointment to lawyer group: %s", e)
 
     if group_msg:
         app.group_message_id = group_msg.message_id
         db_session.add(app)
         db_session.commit()
 
+        if desc_part2:
+            try:
+                await bot.send_message(
+                    chat_id=group_id,
+                    text=f"📌 <b>Ariza №{app.id} — Muammo tavsifining davomi:</b><br/><p><blockquote>{escape_multiline(desc_part2)}</blockquote></p>",
+                    reply_to_message_id=group_msg.message_id,
+                    parse_mode=SULGUK_PARSE_MODE,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True)
+                )
+            except Exception as e:
+                logger.warning("Failed to send appointment problem continuation: %s", e)
+
         # Send all attached media items (voice, video, note, doc, photo) as threaded replies to group_msg
+        media_count = len(media_items)
         for idx, item in enumerate(media_items, 1):
+            await asyncio.sleep(0.15)
             m_type = item.get("type")
             m_fid = item.get("file_id")
             m_name = item.get("name", "Fayl")
@@ -785,21 +553,7 @@ async def execute_appointment_submission(user: User, lang: str, state: FSMContex
                         reply_to_message_id=group_msg.message_id
                     )
             except Exception as me:
-                print(f"Failed to send attached media {idx} ({m_type}) to lawyer group:", me)
-
-    # Notify specific lawyer in private chat if pre-selected
-    if lawyer_id:
-        try:
-            lawyer_private_text = (
-                f"🔔 <b>Hurmatli yurist! Sizga yangi qabul belgilandi (Ariza №{app.id}):</b><br/><br/>"
-                f"👤 Fuqaro: <b>{user.first_name} {user.last_name or ''}</b><br/>"
-                f"📞 Tel: {user.phone or 'noma lum'}<br/>"
-                f"📅 Belgilangan vaqt: <b>{formatted_time}</b><br/>"
-                f"📝 Muammo: <i>{problem_description}</i>"
-            )
-            await bot.send_message(chat_id=lawyer_id, text=lawyer_private_text, parse_mode=SULGUK_PARSE_MODE)
-        except Exception:
-            pass
+                logger.warning("Failed to send attached media %d (%s) to lawyer group: %s", idx, m_type, me)
 
     await state.clear()
 
@@ -810,22 +564,11 @@ async def execute_appointment_submission(user: User, lang: str, state: FSMContex
             pass
         await query.answer()
 
-    success_msg = (
-        f"✅ <b>Qabul muvaffaqiyatli band qilindi! (Ariza №{app.id})</b><br/><br/>"
-        f"📅 <b>Sana va vaqt:</b> {formatted_time}<br/>"
-        f"👨‍⚖️ <b>Yurist:</b> {lawyer_name}<br/>"
-        f"🏢 <b>Qabul shakli:</b> {app_type_text}<br/><br/>"
-        "⏰ <i>Suhbat boshlanishiga 1 soat qolganda bot sizga eslatma yuboradi. Iltimos, belgilangan vaqtda aloqada bo'ling!</i>"
-        if lang == "uz"
-        else (
-            f"✅ <b>Запись успешно оформлена! (Заявка №{app.id})</b><br/><br/>"
-            f"📅 <b>Дата и время:</b> {formatted_time}<br/>"
-            f"👨‍⚖️ <b>Юрист:</b> {lawyer_name}<br/><br/>"
-            "⏰ <i>За 1 час до консультации вам придет напоминание.</i>"
-        )
-    )
+    app_type_text = get_appointment_type_display(app.appointment_type, lang)
 
-    await message_target.answer(success_msg, reply_markup=get_main_menu(lang), parse_mode=SULGUK_PARSE_MODE)
+    success_msg = t("app_submitted", lang, id=app.id, app_type=app_type_text)
+
+    await message_target.answer(success_msg, reply_markup=get_role_menu(user.user_id, lang, db_session), parse_mode=SULGUK_PARSE_MODE)
 
 
 @appointment_router.callback_query(AppointmentState.confirming_booking, F.data == "app_confirm:yes")
@@ -837,7 +580,12 @@ async def confirm_booking_callback(query: CallbackQuery, state: FSMContext, db_s
 
 @appointment_router.message(
     AppointmentState.confirming_booking,
-    F.text.in_(["✅ Qabulni tasdiqlash", "✅ Подтвердить прием", "✅ Tasdiqlash", "📤 Yuborish", "📤 Отправить", "✅ Ha", "✅ Да"])
+    F.text.in_([
+        "✅ Qabulni tasdiqlash", "✅ Подтвердить прием", "✅ Қабулни тасдиқлаш",
+        "✅ Tasdiqlash", "✅ Тасдиқлаш",
+        "📤 Yuborish", "📤 Отправить", "📤 Юбориш",
+        "✅ Ha", "✅ Да", "✅ Ҳа"
+    ])
 )
 async def confirm_booking_text_message(message: Message, state: FSMContext, db_session: DBSession, bot: Bot):
     user = User.get_by_user_id(message.from_user.id, db_session)
@@ -847,55 +595,70 @@ async def confirm_booking_text_message(message: Message, state: FSMContext, db_s
 
 @appointment_router.message(
     AppointmentState.confirming_booking,
-    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "ru"), "❌ Bekor qilish", "❌ Отмена"])
+    F.text.in_([t("btn_cancel", "uz"), t("btn_cancel", "ru"), t("btn_cancel", "oz"), "❌ Bekor qilish", "❌ Отмена", "❌ Бекор қилиш"])
 )
 async def cancel_booking_text_message(message: Message, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(message.from_user.id, db_session)
+    user_id = message.from_user.id
+    if user_id in _pending_media_ack_tasks:
+        _pending_media_ack_tasks[user_id].cancel()
+        _pending_media_ack_tasks.pop(user_id, None)
+
+    user = User.get_by_user_id(user_id, db_session)
     lang = user.language if user else LANG_UZ
     await state.clear()
-    await message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+    await message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 @appointment_router.message(AppointmentState.confirming_booking)
 async def extra_media_in_confirming(message: Message, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(message.from_user.id, db_session)
+    user_id = message.from_user.id
+    user = User.get_by_user_id(user_id, db_session)
     lang = user.language if user else LANG_UZ
-    data = await state.get_data()
-    current_desc = data.get("problem_description", "")
 
-    if message.text:
-        current_desc = f"{current_desc}\n{message.text}".strip()
-    elif message.voice:
-        await state.update_data(media_type="voice", media_file_id=message.voice.file_id, media_name="Ovozli xabar")
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip()
-    elif message.document:
-        await state.update_data(media_type="document", media_file_id=message.document.file_id, media_name=message.document.file_name or "Hujjat.pdf")
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip()
-    elif message.photo:
-        await state.update_data(media_type="photo", media_file_id=message.photo[-1].file_id, media_name="Fotohujjat")
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip()
-    elif message.video:
-        await state.update_data(media_type="video", media_file_id=message.video.file_id, media_name="Video fayl")
-        if message.caption:
-            current_desc = f"{current_desc}\n{message.caption}".strip()
+    async with get_appointment_user_lock(user_id):
+        data = await state.get_data()
+        current_desc = data.get("problem_description", "")
+        media_items = list(data.get("media_items", []))
 
-    await state.update_data(problem_description=current_desc)
-    await render_confirmation_card(message, state, lang)
+        is_media_msg = bool(message.voice or message.video_note or message.video or message.document or message.photo)
+        if is_media_msg and len(media_items) >= 10:
+            limit_err = t("appointment_media_limit_reached", lang)
+            return await message.answer(limit_err, parse_mode=SULGUK_PARSE_MODE)
+
+        if message.text:
+            current_desc = _append_text(current_desc, message.text)
+        else:
+            item = appointment_media_item(message, lang)
+            if item is None:
+                return
+            media_items.append(item)
+            current_desc = _append_text(current_desc, message.caption)
+        latest_media = media_items[-1] if media_items else None
+        await state.update_data(
+            media_items=media_items,
+            media_type=latest_media["type"] if latest_media else "text",
+            media_file_id=latest_media["file_id"] if latest_media else None,
+            media_name=latest_media["name"] if latest_media else None,
+            problem_description=current_desc
+        )
+        await render_confirmation_card(message, state, lang)
 
 
 @appointment_router.callback_query(F.data == "app_cancel", StateFilter("*"))
 async def cancel_appointment_callback(query: CallbackQuery, state: FSMContext, db_session: DBSession):
-    user = User.get_by_user_id(query.from_user.id, db_session)
+    user_id = query.from_user.id
+    if user_id in _pending_media_ack_tasks:
+        _pending_media_ack_tasks[user_id].cancel()
+        _pending_media_ack_tasks.pop(user_id, None)
+
+    user = User.get_by_user_id(user_id, db_session)
     lang = user.language if user else LANG_UZ
     await state.clear()
     try:
         await query.message.delete()
     except Exception:
         pass
-    await query.message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+    await query.message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(query.from_user.id, lang, db_session))
     try:
         await query.answer()
     except Exception:
@@ -937,6 +700,7 @@ async def handle_appointment_feedback_message(message: Message, state: FSMContex
 
     if message.text in [
         t("menu_profile", "uz"), t("menu_profile", "ru"),
+        t("menu_benefits", "uz"), t("menu_benefits", "ru"),
         t("menu_inquiry", "uz"), t("menu_inquiry", "ru"),
         t("menu_appointment", "uz"), t("menu_appointment", "ru"),
         t("menu_about_us", "uz"), t("menu_about_us", "ru"),
@@ -957,7 +721,7 @@ async def handle_appointment_feedback_message(message: Message, state: FSMContex
             db_session.commit()
 
     await state.clear()
-    await message.answer(t("feedback_recorded", lang), reply_markup=get_main_menu(lang))
+    await message.answer(t("feedback_recorded", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 # --- User-initiated Appointment Cancellation ---
@@ -972,24 +736,13 @@ async def app_user_cancel_prompt_handler(query: CallbackQuery, state: FSMContext
     lang = user.language if user else LANG_UZ
 
     if not app or app.user_id != query.from_user.id:
-        return await query.answer("Ariza topilmadi!", show_alert=True)
+        return await query.answer(t("app_not_found", lang), show_alert=True)
 
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text="✅ Ha, bekor qilinsin" if lang == "uz" else "✅ Да, отменить",
-        callback_data=f"app_user_cancel_confirm:{app_id}"
-    )
-    builder.button(
-        text="⬅️ Yo'q, qolsin" if lang == "uz" else "⬅️ Нет, оставить",
-        callback_data="app_cancel"
-    )
+    builder.button(text=t("btn_app_cancel_yes", lang), callback_data=f"app_user_cancel_confirm:{app_id}")
+    builder.button(text=t("btn_app_cancel_no", lang), callback_data="app_cancel")
     builder.adjust(1)
-
-    confirm_text = (
-        f"❓ <b>Haqiqatan ham №{app_id}-sonli qabul arizangizni bekor qilmoqchimisiz?</b>"
-        if lang == "uz" else
-        f"❓ <b>Вы действительно хотите отменить запись №{app_id}?</b>"
-    )
+    confirm_text = t("app_cancel_confirm", lang, id=app_id)
     await query.message.edit_text(confirm_text, reply_markup=builder.as_markup(), parse_mode=SULGUK_PARSE_MODE)
     await query.answer()
 
@@ -1003,31 +756,36 @@ async def app_user_cancel_confirm_handler(query: CallbackQuery, db_session: DBSe
     lang = user.language if user else LANG_UZ
 
     if not app or app.user_id != query.from_user.id:
-        return await query.answer("Ariza topilmadi!", show_alert=True)
+        return await query.answer(t("app_not_found", lang), show_alert=True)
 
     if app.status in [AppointmentStatus.completed, AppointmentStatus.cancelled]:
-        await query.answer("Ushbu ariza allaqachon yakunlangan yoki bekor qilingan!", show_alert=True)
-        return await query.message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+        alert_msg = t("app_already_closed", lang)
+        await query.answer(alert_msg, show_alert=True)
+        return await query.message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(query.from_user.id, lang, db_session))
 
     app.status = AppointmentStatus.cancelled
     app.cancellation_reason = "Foydalanuvchi tomonidan bekor qilindi"
     app.updated_at = datetime.now()
     db_session.add(app)
     db_session.commit()
+    logger.info("Appointment %s cancelled by citizen %s", app.id, query.from_user.id)
 
-    # If message was posted in lawyer group, notify group and disable claim button
+    # If message was posted in lawyer group, notify group and update card
     if app.group_message_id:
         group_id = settings.LAWYER_APPOINTMENT_GROUP_ID
         try:
-            await bot.edit_message_reply_markup(
+            card_text = render_appointment_card(app, db_session)
+            card_markup = get_appointment_markup(app)
+            await bot.edit_message_text(
                 chat_id=group_id,
                 message_id=app.group_message_id,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="❌ Fuqaro tomonidan bekor qilingan", callback_data="none")
-                ]])
+                text=card_text,
+                reply_markup=card_markup,
+                parse_mode=SULGUK_PARSE_MODE,
+                link_preview_options=LinkPreviewOptions(is_disabled=True)
             )
         except Exception as e:
-            print("Failed to update group card markup on cancel:", e)
+            logger.warning("Failed to update group card on cancel: %s", e)
 
         try:
             await bot.send_message(
@@ -1037,18 +795,62 @@ async def app_user_cancel_confirm_handler(query: CallbackQuery, db_session: DBSe
                 parse_mode=SULGUK_PARSE_MODE
             )
         except Exception as e:
-            print("Failed to notify group of user cancellation:", e)
+            logger.warning("Failed to notify group of user cancellation: %s", e)
 
-    await query.answer("Qabul bekor qilindi!")
-    success_text = (
-        f"✅ <b>№{app.id}-sonli qabul arizangiz muvaffaqiyatli bekor qilindi.</b><br/><br/>"
-        "Endi yangi qabul arizasini topshirishingiz mumkin."
-        if lang == "uz" else
-        f"✅ <b>Запись №{app.id} успешно отменена.</b><br/><br/>"
-        "Теперь вы можете оформить новую запись."
-    )
+    await query.answer(t("app_cancelled_short", lang))
+    success_text = t("app_cancelled_by_citizen", lang, id=app.id)
     try:
         await query.message.delete()
     except Exception:
         pass
-    await query.message.answer(success_text, reply_markup=get_main_menu(lang), parse_mode=SULGUK_PARSE_MODE)
+    await query.message.answer(success_text, reply_markup=get_role_menu(query.from_user.id, lang, db_session), parse_mode=SULGUK_PARSE_MODE)
+
+
+@appointment_router.callback_query(F.data.startswith("app_att:"), StateFilter("*"))
+async def appointment_attendance_callback(query: CallbackQuery, db_session: DBSession, bot: Bot):
+    """Fuqaro qabulga tayyorligini tasdiqlaydi yoki boshqa vaqt kerakligini bildiradi."""
+    user = User.get_by_user_id(query.from_user.id, db_session)
+    lang = (user.language if user else None) or LANG_UZ
+    try:
+        _, app_id_s, answer = query.data.split(":")
+        app = db_session.get(Appointment, int(app_id_s))
+    except (ValueError, IndexError):
+        app, answer = None, ""
+    if not app or app.user_id != query.from_user.id or answer not in ("yes", "no"):
+        return await query.answer(t("app_not_found", lang), show_alert=True)
+    if app.status not in (AppointmentStatus.pending, AppointmentStatus.accepted):
+        await query.answer(t("app_already_closed", lang), show_alert=True)
+        return await query.message.edit_reply_markup(reply_markup=None)
+
+    app.citizen_confirmation = answer
+    app.updated_at = datetime.now()
+    db_session.add(app)
+    db_session.commit()
+    logger.info("Appointment %s: citizen attendance=%s", app.id, answer)
+    await query.answer()
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.message.answer(t("app_attend_yes_reply" if answer == "yes" else "app_attend_no_reply", lang))
+
+    if app.group_message_id:
+        group_id = settings.LAWYER_APPOINTMENT_GROUP_ID
+        try:
+            await bot.edit_message_text(
+                chat_id=group_id, message_id=app.group_message_id,
+                text=render_appointment_card(app, db_session), reply_markup=get_appointment_markup(app),
+                parse_mode=SULGUK_PARSE_MODE, link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception as e:
+            logger.info("Appointment %s card not refreshed: %s", app.id, e)
+        if answer == "no":
+            try:
+                await bot.send_message(
+                    chat_id=group_id,
+                    text=f"⚠️ <b>Ariza №{app.id}:</b> fuqaro belgilangan vaqtda qatnasha olmasligini bildirdi — yangi vaqt belgilang.",
+                    reply_to_message_id=app.group_message_id,
+                    parse_mode=SULGUK_PARSE_MODE,
+                )
+            except Exception as e:
+                logger.info("Appointment %s group notice failed: %s", app.id, e)

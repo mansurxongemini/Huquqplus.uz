@@ -3,15 +3,18 @@ from sulguk import SULGUK_PARSE_MODE
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 from src.app.enums import (
     disability_types_uz,
+    disability_types_oz,
     disability_types_ru,
     disability_states_uz,
+    disability_states_oz,
     disability_states_ru,
     regions_uz,
+    regions_oz,
     regions_ru,
     get_disability_types,
     get_disability_states,
@@ -19,8 +22,8 @@ from src.app.enums import (
     create_user_info,
 )
 from src.app.filters import is_private_message
-from src.app.keyboards import get_main_menu
-from src.app.translations import t, LANG_UZ, LANG_RU
+from src.app.keyboards import get_role_menu
+from src.app.translations import t, LANG_UZ
 from src.models.user import GenderType, User, Region, DisabilityType, DisabilityState
 from src.routes.deps.db_session import DBSession
 
@@ -40,10 +43,14 @@ class RegistrationState(StatesGroup):
     region = State()
 
 
-def find_key_by_value(d_uz: dict, d_ru: dict, text: str) -> str | None:
+def find_key_by_value(d_uz: dict, d_ru: dict, text: str, d_oz: dict | None = None) -> str | None:
     for k, v in d_uz.items():
         if v == text:
             return k
+    if d_oz:
+        for k, v in d_oz.items():
+            if v == text:
+                return k
     for k, v in d_ru.items():
         if v == text:
             return k
@@ -54,7 +61,11 @@ def find_key_by_value(d_uz: dict, d_ru: dict, text: str) -> str | None:
 async def agreement_understood(query: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     lang = data.get("language", LANG_UZ)
-    await query.message.delete()
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
     await state.set_state(RegistrationState.first_name)
     kb = ReplyKeyboardBuilder()
     kb.button(text=t("btn_cancel", lang))
@@ -66,7 +77,7 @@ async def agreement_understood(query: CallbackQuery, state: FSMContext):
 
 
 @registration_router.message(
-    F.text.in_([t("menu_profile", "uz"), t("menu_profile", "ru"), "🪪 Profil", "🪪 Профиль"]),
+    F.text.in_([t("menu_profile", "uz"), t("menu_profile", "oz"), t("menu_profile", "ru"), "🪪 Profil", "🪪 Профил", "🪪 Профиль"]),
     is_private_message,
 )
 async def profile(message: Message, db_session: DBSession):
@@ -94,9 +105,9 @@ async def profile(message: Message, db_session: DBSession):
 
 @registration_router.message(
     F.text.in_([
-        t("btn_cancel", "uz"), t("btn_cancel", "ru"),
-        t("btn_back_main", "uz"), t("btn_back_main", "ru"),
-        "❌ Bekor qilish", "❌ Отмена", "⬅️ Asosiy menyu", "⬅️ Главное меню"
+        t("btn_cancel", "uz"), t("btn_cancel", "oz"), t("btn_cancel", "ru"),
+        t("btn_back_main", "uz"), t("btn_back_main", "oz"), t("btn_back_main", "ru"),
+        "❌ Bekor qilish", "❌ Бекор қилиш", "❌ Отмена", "⬅️ Asosiy menyu", "⬅️ Асосий меню", "⬅️ Главное меню"
     ]),
     is_private_message,
 )
@@ -105,11 +116,11 @@ async def cancel_or_main_menu(message: Message, state: FSMContext, db_session: D
     data = await state.get_data()
     lang = user.language if user else data.get("language", LANG_UZ)
     await state.clear()
-    await message.answer(t("btn_back_main", lang), reply_markup=get_main_menu(lang))
+    await message.answer(t("btn_back_main", lang), reply_markup=get_role_menu(message.from_user.id, lang, db_session))
 
 
 @registration_router.message(
-    F.text.in_([t("profile_edit_btn", "uz"), t("profile_edit_btn", "ru"), "🪪 O‘zgartirish", "🪪 Изменить"]),
+    F.text.in_([t("profile_edit_btn", "uz"), t("profile_edit_btn", "oz"), t("profile_edit_btn", "ru"), "🪪 O‘zgartirish", "🪪 Ўзгартириш", "🪪 Изменить"]),
     is_private_message,
 )
 async def start_profile_edit(message: Message, state: FSMContext, db_session: DBSession):
@@ -161,8 +172,8 @@ async def get_last_name(message: Message, state: FSMContext):
 async def get_gender(message: Message, state: FSMContext):
     data = await state.get_data()
     lang = data.get("language", LANG_UZ)
-    valid_male = ["👦🏻 Erkak", "Erkak", "👦🏻 Мужской", "Мужской"]
-    valid_female = ["👧🏻 Ayol", "Ayol", "👧🏻 Женский", "Женский"]
+    valid_male = ["👦🏻 Erkak", "Erkak", "👦🏻 Эркак", "Эркак", "👦🏻 Мужской", "Мужской"]
+    valid_female = ["👧🏻 Ayol", "Ayol", "👧🏻 Аёл", "Аёл", "👧🏻 Женский", "Женский"]
 
     if message.text in valid_male:
         selected_gender = GenderType.male
@@ -234,7 +245,7 @@ async def get_disability_type(message: Message, state: FSMContext):
     data = await state.get_data()
     lang = data.get("language", LANG_UZ)
 
-    d_key = find_key_by_value(disability_types_uz, disability_types_ru, message.text)
+    d_key = find_key_by_value(disability_types_uz, disability_types_ru, message.text, disability_types_oz)
     if not d_key:
         return await message.reply(t("reg_choose_disability_type", lang))
 
@@ -257,7 +268,7 @@ async def get_disability_state(message: Message, state: FSMContext):
     data = await state.get_data()
     lang = data.get("language", LANG_UZ)
 
-    s_key = find_key_by_value(disability_states_uz, disability_states_ru, message.text)
+    s_key = find_key_by_value(disability_states_uz, disability_states_ru, message.text, disability_states_oz)
     if not s_key:
         return await message.reply(t("reg_choose_disability_state", lang))
 
@@ -280,7 +291,7 @@ async def get_region(message: Message, state: FSMContext, db_session: DBSession)
     data = await state.get_data()
     lang = data.get("language", LANG_UZ)
 
-    r_key = find_key_by_value(regions_uz, regions_ru, message.text)
+    r_key = find_key_by_value(regions_uz, regions_ru, message.text, regions_oz)
     if not r_key:
         return await message.reply(t("reg_choose_region", lang))
 
@@ -317,5 +328,5 @@ async def get_region(message: Message, state: FSMContext, db_session: DBSession)
     await state.clear()
     await message.answer(
         t("reg_success", lang),
-        reply_markup=get_main_menu(lang),
+        reply_markup=get_role_menu(message.from_user.id, lang, db_session),
     )

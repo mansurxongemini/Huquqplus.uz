@@ -1,9 +1,11 @@
+import logging
 from aiogram.types import Update
 from fastapi import APIRouter, Request, HTTPException, status
-import traceback
 from src.config.bot import dp, bot
 from src.config.settings import settings
 from src.routes.deps.db_session import DBSession
+
+logger = logging.getLogger(__name__)
 
 api_router = APIRouter()
 
@@ -19,9 +21,8 @@ async def root(update: Update, db_session: DBSession, request: Request):
     try:
         await dp.feed_update(bot, update, db_session=db_session)
     except Exception as e:
-        print(update)
-        print(traceback.format_exc())
-        print("Failed to handle update", e)
+        logger.exception("Update handling traceback")
+        logger.warning("Failed to handle update: %s", e)
     return {"ok": True}
 
 
