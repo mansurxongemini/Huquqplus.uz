@@ -1,9 +1,14 @@
+import html
 from src.models.user import Region, User, GenderType
 
 
 gender_types_uz = {
     'male': 'Erkak',
     'female': 'Ayol',
+}
+gender_types_oz = {
+    'male': 'Эркак',
+    'female': 'Аёл',
 }
 gender_types_ru = {
     'male': 'Мужской',
@@ -17,6 +22,13 @@ disability_types_uz = {
     'third_degree': '3⃣ Uchinchi guruh',
     'forth_degree': '4⃣ Toʻrtinchi guruh (18 yoshgacha nogironligi boʻlgan bola)',
     'none': '🚫 Nogironlik guruhi yoʻq',
+}
+disability_types_oz = {
+    'first_degree': '1⃣ Биринчи гуруҳ',
+    'second_degree': '2⃣ Иккинчи гуруҳ',
+    'third_degree': '3⃣ Учинчи гуруҳ',
+    'forth_degree': '4⃣ Тўртинчи гуруҳ (18 ёшгача ногиронлиги бўлган бола)',
+    'none': '🚫 Ногиронлик гуруҳи йўқ',
 }
 disability_types_ru = {
     'first_degree': '1⃣ Первая группа',
@@ -37,6 +49,16 @@ disability_states_uz = {
     'aids': '🩸OIV/OITS bo‘yicha nogironlik',
     'other': 'Boshqa',
 }
+disability_states_oz = {
+    'physical': '👩🏻‍🦽 Жисмоний ногиронлик',
+    'vision': '🧑🏻‍🦯 Кўриш бўйича ногиронлик',
+    'hearing': '🧏🏻‍♀ Эшитиш бўйича ногиронлик',
+    'mental': '🧠 Ақлий ногиронлик',
+    'psychological': '❤️‍🩹 Руҳий ногиронлик',
+    'parent': '👩🏻‍🍼Ногиронлиги бўлган боланинг ота-онаси',
+    'aids': '🩸ОИВ/ОИТС бўйича ногиронлик',
+    'other': 'Бошқа',
+}
 disability_states_ru = {
     'physical': '👩🏻‍🦽 Физическая инвалидность',
     'vision': '🧑🏻‍🦯 Инвалидность по зрению',
@@ -50,6 +72,22 @@ disability_states_ru = {
 disability_states = disability_states_uz
 
 regions_uz = {region.name: region.value for region in Region}
+regions_oz = {
+    'R0': 'Тошкент шаҳар',
+    'R1': 'Андижон вилояти',
+    'R2': 'Бухоро вилояти',
+    'R3': 'Фарғона вилояти',
+    'R4': 'Жиззах вилояти',
+    'R5': 'Хоразм вилояти',
+    'R6': 'Наманган вилояти',
+    'R7': 'Навоий вилояти',
+    'R8': 'Қашқадарё вилояти',
+    'R9': 'Қорақалпоғистон Республикаси',
+    'R10': 'Самарқанд вилояти',
+    'R11': 'Сирдарё вилояти',
+    'R12': 'Сурхондарё вилояти',
+    'R13': 'Тошкент вилояти',
+}
 regions_ru = {
     'R0': 'г. Ташкент',
     'R1': 'Андижанская область',
@@ -70,25 +108,40 @@ regions = regions_uz
 
 
 def get_gender_types(lang: str = "uz") -> dict[str, str]:
-    return gender_types_ru if lang == "ru" else gender_types_uz
+    if lang == "ru":
+        return gender_types_ru
+    elif lang == "oz":
+        return gender_types_oz
+    return gender_types_uz
 
 
 def get_disability_types(lang: str = "uz") -> dict[str, str]:
-    return disability_types_ru if lang == "ru" else disability_types_uz
+    if lang == "ru":
+        return disability_types_ru
+    elif lang == "oz":
+        return disability_types_oz
+    return disability_types_uz
 
 
 def get_disability_states(lang: str = "uz") -> dict[str, str]:
-    return disability_states_ru if lang == "ru" else disability_states_uz
+    if lang == "ru":
+        return disability_states_ru
+    elif lang == "oz":
+        return disability_states_oz
+    return disability_states_uz
 
 
 def get_regions(lang: str = "uz") -> dict[str, str]:
-    return regions_ru if lang == "ru" else regions_uz
+    if lang == "ru":
+        return regions_ru
+    elif lang == "oz":
+        return regions_oz
+    return regions_uz
 
 
-import html
-
-
-def create_user_info(user: User, with_link=True, lang: str | None = None) -> str:
+def create_user_info(user: User | None, with_link=True, lang: str | None = None) -> str:
+    if not user:
+        return ""
     user_lang = lang or getattr(user, 'language', 'uz') or 'uz'
     if not user.username:
         user_link = f'tg://user?id={user.user_id}'
@@ -103,18 +156,39 @@ def create_user_info(user: User, with_link=True, lang: str | None = None) -> str
         d_type = disability_types_ru.get(user.disability_type.value if user.disability_type else '', 'Не указана')
         d_state = disability_states_ru.get(user.disability_state.value if user.disability_state else '', 'Не указано')
         user_str = (
-            f"• <b>Имя:</b> {name}<br/>"
-            f"• <b>ID:</b> <code>{user.user_id}</code><br/>"
-            f"• <b>Год рождения:</b> {user.birth_year or 'Не указан'}<br/>"
-            f"• <b>Пол:</b> {gender_text}<br/>"
-            f"• <b>Регион:</b> {region_text}<br/>"
-            f"• <b>Группа инвалидности:</b> {d_type}<br/>"
-            f"• <b>Форма инвалидности:</b> {d_state}<br/>"
-            f"• <b>Номер телефона:</b> {user.phone or 'Не указан'}<br/>"
-            f"• <b>Язык общения:</b> Русский 🇷🇺<br/>"
+            f"<b>Имя:</b> {name}<br/>"
+            f"<b>ID:</b> <code>{user.user_id}</code><br/>"
+            f"<b>Год рождения:</b> {user.birth_year or 'Не указан'}<br/>"
+            f"<b>Пол:</b> {gender_text}<br/>"
+            f"<b>Регион:</b> {region_text}<br/>"
+            f"<b>Группа инвалидности:</b> {d_type}<br/>"
+            f"<b>Форма инвалидности:</b> {d_state}<br/>"
+            f"<b>Номер телефона:</b> {user.phone or 'Не указан'}<br/>"
+            f"<b>Язык общения:</b> Русский 🇷🇺<br/>"
         )
         if with_link:
-            user_str += f'• 🔗 <b><a href="{user_link}">Ссылка для связи</a></b><br/>'
+            user_str += f'🔗 <b><a href="{user_link}">Ссылка для связи</a></b><br/>'
+    elif user_lang == "oz":
+        gender_text = 'Эркак' if user.gender == GenderType.male else 'Аёл'
+        not_specified = "Кўрсатилмади"
+        region_text = regions_oz.get(user.region.name if user.region else '', not_specified)
+        d_type = disability_types_oz.get(user.disability_type.value if user.disability_type else '', not_specified)
+        d_state = disability_states_oz.get(user.disability_state.value if user.disability_state else '', not_specified)
+        birth_year_text = str(user.birth_year) if user.birth_year else not_specified
+        phone_text = user.phone or not_specified
+        user_str = (
+            f"<b>Исми:</b> {name}<br/>"
+            f"<b>ID:</b> <code>{user.user_id}</code><br/>"
+            f"<b>Туғилган йили:</b> {birth_year_text}<br/>"
+            f"<b>Жинси:</b> {gender_text}<br/>"
+            f"<b>Ҳудуд:</b> {region_text}<br/>"
+            f"<b>Ногиронлик гуруҳи:</b> {d_type}<br/>"
+            f"<b>Ногиронлик ҳолати:</b> {d_state}<br/>"
+            f"<b>Телефон рақами:</b> {phone_text}<br/>"
+            f"<b>Мулоқот тили:</b> Ўзбекча (Кирилл) 🇺🇿<br/>"
+        )
+        if with_link:
+            user_str += f'🔗 <b><a href="{user_link}">Боғланиш учун ҳавола</a></b><br/>'
     else:
         gender_text = 'Erkak' if user.gender == GenderType.male else 'Ayol'
         not_specified = "Ko'rsatilmadi"
@@ -124,17 +198,17 @@ def create_user_info(user: User, with_link=True, lang: str | None = None) -> str
         birth_year_text = str(user.birth_year) if user.birth_year else not_specified
         phone_text = user.phone or not_specified
         user_str = (
-            f"• <b>Ismi:</b> {name}<br/>"
-            f"• <b>ID:</b> <code>{user.user_id}</code><br/>"
-            f"• <b>Tug'ilgan yili:</b> {birth_year_text}<br/>"
-            f"• <b>Jinsi:</b> {gender_text}<br/>"
-            f"• <b>Hudud:</b> {region_text}<br/>"
-            f"• <b>Nogironlik guruhi:</b> {d_type}<br/>"
-            f"• <b>Nogironlik holati:</b> {d_state}<br/>"
-            f"• <b>Telefon raqami:</b> {phone_text}<br/>"
-            f"• <b>Muloqot tili:</b> O'zbekcha 🇺🇿<br/>"
+            f"<b>Ismi:</b> {name}<br/>"
+            f"<b>ID:</b> <code>{user.user_id}</code><br/>"
+            f"<b>Tug'ilgan yili:</b> {birth_year_text}<br/>"
+            f"<b>Jinsi:</b> {gender_text}<br/>"
+            f"<b>Hudud:</b> {region_text}<br/>"
+            f"<b>Nogironlik guruhi:</b> {d_type}<br/>"
+            f"<b>Nogironlik holati:</b> {d_state}<br/>"
+            f"<b>Telefon raqami:</b> {phone_text}<br/>"
+            f"<b>Muloqot tili:</b> O'zbekcha 🇺🇿<br/>"
         )
         if with_link:
-            user_str += f'• 🔗 <b><a href="{user_link}">Bog\'lanish uchun havola</a></b><br/>'
+            user_str += f'🔗 <b><a href="{user_link}">Bog\'lanish uchun havola</a></b><br/>'
 
     return user_str
