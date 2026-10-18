@@ -2,3 +2,15 @@
 .env
 data
 __pycache__/
+
+# yangilanish arxivlari, zaxiralar va mahalliy sirlar ombordan tashqarida saqlanadi
+huquqplus_update*.zip
+*.sql
+*.sql.gz
+*.sql.gz.enc
+.env.*
+!.env.example
+
+# yaratilgan hisobotlar (fuqarolar ma'lumotlari bor) va manba hujjatlar ombordan tashqarida
+reports/
+*.docx

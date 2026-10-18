@@ -1,0 +1,34 @@
+# Lokal ishga tushirish: bot + RAG assistant API (RAG shu kompyuterda 127.0.0.1:8000 da ishlaydi).
+#
+#   ./scripts/local_up.sh        (yoki: podman compose -f docker-compose.yaml -f docker-compose.local-ai.yaml up -d --force-recreate mariadb redis app celery_worker)
+#
+# app konteyneri host tarmog'ida ishlaydi: rootless podman'da ko'prik tarmog'idan hostning 127.0.0.1 iga
+# ulanib bo'lmaydi. Shu sabab MariaDB va Redis faqat 127.0.0.1 ga ochiladi (LAN ga emas).
+# RAG_API_URL / RAG_API_KEY .env da turadi.
+services:
+  mariadb:
+    ports: !override
+      - "127.0.0.1:3306:3306"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  app:
+    # migratsiyalar har ishga tushishda avtomatik (prod'dagi prestart.sh kabi)
+    command: sh -c "alembic upgrade head && python -m src.run_polling"
+    network_mode: host
+    ports: !reset []
+    extra_hosts: !reset []
+    environment:
+      DB_HOST: 127.0.0.1
+      REDIS_HOST: 127.0.0.1
+      HOST: 127.0.0.1
+      PORT: "8090"
+
+  celery_worker:
+    network_mode: host
+    extra_hosts: !reset []
+    environment:
+      DB_HOST: 127.0.0.1
+      REDIS_HOST: 127.0.0.1
